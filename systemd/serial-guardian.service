@@ -1,0 +1,17 @@
+[Unit]
+Description=Serial Guardian - MicroPython session monitor + web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/serial-guardian
+ExecStart=/usr/bin/python3 /home/pi/serial-guardian/run.py
+Restart=always
+RestartSec=3
+# 'dialout' for /dev/ttyACM0, 'gpio' only needed if ENABLE_GPIO_RESET is on
+SupplementaryGroups=dialout gpio
+
+[Install]
+WantedBy=multi-user.target
