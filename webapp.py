@@ -4,9 +4,20 @@ Flask web UI for the serial guardian.
 Kept deliberately light (inline templates, no build step, no CDN
 dependencies) since this runs on a Pi Zero W and needs to work even with
 no internet access once it's set up.
+
+NOTE ON EXPOSURE: none of this has any authentication. Everything below
+-- including the new "stop the whole service" button -- is reachable by
+anyone who can reach the Pi on your network. Fine on a trusted home LAN,
+worth knowing if that's not your situation.
 """
+import json
+import subprocess
+import threading
+import time
 
 from flask import Flask, jsonify, render_template_string, request
+
+import fields
 
 STATUS_COLORS = {
     "NORMAL": "#63d68a",
@@ -14,6 +25,13 @@ STATUS_COLORS = {
     "EXCEPTION": "#e55a5a",
     "STOPPED": "#5bc9c9",
 }
+
+
+def esc(s):
+    if s is None:
+        return "—"
+    return str(s).replace("&", "&amp;").replace("<", "&lt;")
+
 
 BASE = """
 <!doctype html>
@@ -43,7 +61,11 @@ BASE = """
   }
   a { color: var(--cyan); text-decoration: none; }
   a:hover { text-decoration: underline; }
-  a:focus-visible, button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+  a:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+  code {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+    padding: 0.05rem 0.35rem; font-size: 0.9em;
+  }
 
   header {
     display: flex; align-items: center; gap: 1.25rem;
@@ -67,17 +89,23 @@ BASE = """
   .dot.down { background: var(--red); box-shadow: 0 0 6px var(--red); }
   .dot.halt { background: var(--cyan); box-shadow: 0 0 6px var(--cyan); }
 
-  main { padding: 1.25rem; max-width: 980px; margin: 0 auto; }
+  main { padding: 1.25rem; max-width: 1080px; margin: 0 auto; }
 
   .stats { display: flex; gap: 0.75rem; margin-bottom: 1rem; flex-wrap: wrap; }
+  a.stat-link { text-decoration: none; }
   .stat {
     background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
-    padding: 0.6rem 0.9rem; min-width: 8em;
+    padding: 0.6rem 0.9rem; min-width: 8em; transition: border-color 0.15s;
   }
+  a.stat-link:hover .stat { border-color: var(--cyan); }
   .stat .n { font-size: 1.4rem; font-weight: 600; }
   .stat .l { color: var(--ink-dim); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; }
 
-  .controls { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 0.8rem 1rem; margin-bottom: 1rem;
+  }
+  .controls { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.6rem; flex-wrap: wrap; }
   button.btn {
     font-family: var(--mono); font-size: 0.85rem; background: var(--panel); color: var(--ink);
     border: 1px solid var(--line); border-radius: 6px; padding: 0.45rem 0.9rem; cursor: pointer;
@@ -85,11 +113,11 @@ BASE = """
   button.btn:hover { border-color: var(--cyan); color: var(--cyan); }
   button.btn.danger:hover { border-color: var(--red); color: var(--red); }
   button.btn:disabled { opacity: 0.45; cursor: default; }
-  #stateNote { color: var(--ink-dim); font-size: 0.85rem; }
+  #stateNote, #svcMsg, .hint { color: var(--ink-dim); font-size: 0.85rem; }
 
   pre.term {
     background: #0a0c0d; border: 1px solid var(--line); border-radius: 6px;
-    padding: 0.9rem 1rem; height: 58vh; overflow-y: auto;
+    padding: 0.9rem 1rem; height: 55vh; overflow-y: auto;
     white-space: pre-wrap; word-break: break-word; margin: 0;
   }
   pre.term .l-exc { border-left: 3px solid var(--red); padding-left: 0.5em; color: #f3a9a9; }
@@ -99,6 +127,7 @@ BASE = """
   th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--line); }
   th { color: var(--ink-dim); font-weight: 500; text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.08em; }
   tr:hover td { background: rgba(255,255,255,0.02); }
+  td.extra, th.extra { color: var(--ink-dim); font-size: 0.85em; }
 
   .badge {
     display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px;
@@ -115,6 +144,13 @@ BASE = """
   .meta { color: var(--ink-dim); margin-bottom: 0.75rem; }
   .meta b { color: var(--ink); }
   footer { text-align: center; color: var(--ink-dim); padding: 2rem 1rem; font-size: 0.78rem; }
+
+  details.fc summary { cursor: pointer; color: var(--ink-dim); margin-bottom: 0.6rem; }
+  details.fc[open] summary { color: var(--ink); }
+  .fc table input {
+    font-family: var(--mono); background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 4px; padding: 0.3rem 0.5rem; width: 100%;
+  }
 </style>
 </head>
 <body>
@@ -142,34 +178,52 @@ def render(title, active, body):
 def create_app(monitor, cfg):
     app = Flask(__name__)
 
+    # ------------------------------------------------------------------ #
+    # Live page
+    # ------------------------------------------------------------------ #
     @app.route("/")
     def live():
         st = monitor.get_status()
         stats_html = "".join(
-            f'<div class="stat"><div class="n" style="color:{STATUS_COLORS[k]}">{v}</div>'
-            f'<div class="l">{k}</div></div>'
+            f'<a class="stat-link" href="/sessions?status={k}"><div class="stat">'
+            f'<div class="n" style="color:{STATUS_COLORS[k]}">{v}</div>'
+            f'<div class="l">{k}</div></div></a>'
             for k, v in st["stats"].items()
         )
         body = f"""
         <p id="connLine"></p>
         <div class="stats">{stats_html}</div>
-        <div class="controls">
-          <button id="stopBtn" class="btn danger" onclick="doStop()">Stop device on next update</button>
-          <button id="resumeBtn" class="btn" onclick="doResume()" style="display:none">Resume</button>
-          <span id="stateNote"></span>
+
+        <div class="panel">
+          <div class="controls">
+            <button id="stopBtn" class="btn danger" onclick="doStop()">Stop device on next update</button>
+            <button id="resumeBtn" class="btn" onclick="doResume()" style="display:none">Resume</button>
+            <span id="stateNote"></span>
+          </div>
         </div>
+
+        <div class="panel">
+          <div class="controls">
+            <button class="btn" onclick="doService('restart')">Restart service</button>
+            <button class="btn danger" onclick="doService('stop')">Stop service</button>
+            <span id="svcMsg"></span>
+          </div>
+          <div class="hint">Stop takes this whole page down along with monitoring &mdash;
+            bring it back over SSH with <code>sudo systemctl start {cfg.SERVICE_NAME}</code></div>
+        </div>
+
         <pre class="term" id="tail"></pre>
         <script>
         function fmt(line) {{
-          const esc = line.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+          const escd = line.replace(/&/g,'&amp;').replace(/</g,'&lt;');
           if (line.includes('Traceback') || line.includes('MemoryError') ||
               line.includes('Exception handler: caught exception')) {{
-            return '<span class="l-exc">' + esc + '</span>';
+            return '<span class="l-exc">' + escd + '</span>';
           }}
           if (line.includes('{cfg.GOTOSLEEP_MARKER}')) {{
-            return '<span class="l-ok">' + esc + '</span>';
+            return '<span class="l-ok">' + escd + '</span>';
           }}
-          return esc;
+          return escd;
         }}
         function applyStatus(s) {{
           const dot = s.halted ? 'halt' : (s.connected ? 'up' : 'down');
@@ -203,6 +257,15 @@ def create_app(monitor, cfg):
             document.getElementById('resumeBtn').disabled = false;
           }}
         }}
+        async function doService(action) {{
+          const msgs = {{
+            restart: 'Restart the guardian service now? This briefly interrupts monitoring.',
+            stop: 'Stop the guardian service? This page goes unreachable until you SSH in and run:\\nsudo systemctl start {cfg.SERVICE_NAME}'
+          }};
+          if (!confirm(msgs[action])) return;
+          document.getElementById('svcMsg').textContent = action + ' requested...';
+          try {{ await fetch('/api/service/' + action, {{method:'POST'}}); }} catch (e) {{}}
+        }}
         async function poll() {{
           try {{
             const res = await fetch('/api/tail');
@@ -234,12 +297,41 @@ def create_app(monitor, cfg):
         monitor.resume()
         return jsonify(monitor.get_status())
 
+    # ------------------------------------------------------------------ #
+    # systemd service control
+    # ------------------------------------------------------------------ #
+    def _delayed_systemctl(action):
+        def run():
+            time.sleep(0.6)   # let the HTTP response for this request go out first
+            try:
+                subprocess.run(
+                    ["sudo", "-n", "systemctl", action, cfg.SERVICE_NAME],
+                    timeout=10,
+                )
+            except Exception:
+                pass  # sudoers rule not installed yet, or not running under systemd
+        threading.Thread(target=run, daemon=True).start()
+
+    @app.route("/api/service/restart", methods=["POST"])
+    def api_service_restart():
+        _delayed_systemctl("restart")
+        return jsonify({"ok": True, "action": "restart"})
+
+    @app.route("/api/service/stop", methods=["POST"])
+    def api_service_stop():
+        _delayed_systemctl("stop")
+        return jsonify({"ok": True, "action": "stop"})
+
+    # ------------------------------------------------------------------ #
+    # Sessions page, with configurable extra columns
+    # ------------------------------------------------------------------ #
     @app.route("/sessions")
     def sessions():
         status = request.args.get("status")
         if status not in (None, "NORMAL", "ANOMALY", "EXCEPTION", "STOPPED"):
             status = None
         records = monitor.recent_sessions(n=200, status=status)
+        extractors = fields.load(cfg)
 
         def link(label, val):
             cls = "active" if status == val else ""
@@ -251,27 +343,101 @@ def create_app(monitor, cfg):
             + link("Exception", "EXCEPTION") + link("Stopped", "STOPPED")
         )
 
+        extra_headers = "".join(f'<th class="extra">{esc(e["name"])}</th>' for e in extractors)
+
         rows = ""
         for r in records:
             color = STATUS_COLORS[r["status"]]
+            text = monitor.read_session_text(r["id"])
+            values = fields.extract(text, extractors)
+            extra_cells = "".join(f'<td class="extra">{esc(values[e["name"]])}</td>' for e in extractors)
             rows += (
                 f'<tr onclick="location.href=\'/sessions/{r["id"]}\'" style="cursor:pointer">'
                 f'<td>#{r["id"]}</td>'
                 f'<td><span class="badge" style="background:{color}22;color:{color}">{r["status"]}</span></td>'
                 f'<td>{r["duration"]}s</td>'
                 f'<td>{r["lines"]} lines</td>'
+                f'{extra_cells}'
                 f'<td><a href="/sessions/{r["id"]}">view</a></td>'
                 f'</tr>'
             )
+
+        fc_rows_json = json.dumps(extractors)
         body = f"""
         <div class="filters">{filters}</div>
         <table>
-          <tr><th>id</th><th>status</th><th>duration</th><th>size</th><th></th></tr>
-          {rows or '<tr><td colspan="5">no sessions recorded yet</td></tr>'}
+          <tr><th>id</th><th>status</th><th>duration</th><th>size</th>{extra_headers}<th></th></tr>
+          {rows or f'<tr><td colspan="{5 + len(extractors)}">no sessions recorded yet</td></tr>'}
         </table>
+
+        <details class="fc panel" style="margin-top:1.25rem">
+          <summary>Configure extra columns ({len(extractors)})</summary>
+          <table id="fcTable">
+            <tr><th>Column</th><th>Regex (exactly one capture group)</th><th></th></tr>
+          </table>
+          <div class="controls" style="margin-top:0.6rem">
+            <button class="btn" onclick="fcAddRow()">+ add column</button>
+            <button class="btn" onclick="fcSave()">Save</button>
+            <span id="fcMsg"></span>
+          </div>
+          <div class="hint">Changes apply immediately to sessions already on disk, not just new ones --
+            these are read from the raw log at view time, not baked in when a session finishes.</div>
+        </details>
+        <script>
+        let fcExtractors = {fc_rows_json};
+        function fcRender() {{
+          const tbl = document.getElementById('fcTable');
+          tbl.querySelectorAll('tr.fc-row').forEach(r => r.remove());
+          fcExtractors.forEach((e, i) => {{
+            const tr = document.createElement('tr');
+            tr.className = 'fc-row';
+            const nameInp = document.createElement('input');
+            nameInp.value = e.name; nameInp.dataset.i = i; nameInp.dataset.f = 'name';
+            const patInp = document.createElement('input');
+            patInp.value = e.pattern; patInp.dataset.i = i; patInp.dataset.f = 'pattern';
+            const tdName = document.createElement('td'); tdName.appendChild(nameInp);
+            const tdPat = document.createElement('td'); tdPat.appendChild(patInp);
+            const tdDel = document.createElement('td');
+            const delBtn = document.createElement('button');
+            delBtn.className = 'btn'; delBtn.textContent = '\\u00d7';
+            delBtn.onclick = () => fcRemove(i);
+            tdDel.appendChild(delBtn);
+            tr.appendChild(tdName); tr.appendChild(tdPat); tr.appendChild(tdDel);
+            tbl.appendChild(tr);
+          }});
+        }}
+        function fcAddRow() {{ fcExtractors.push({{name:'', pattern:''}}); fcRender(); }}
+        function fcRemove(i) {{ fcExtractors.splice(i,1); fcRender(); }}
+        async function fcSave() {{
+          document.querySelectorAll('#fcTable input').forEach(inp => {{
+            fcExtractors[inp.dataset.i][inp.dataset.f] = inp.value;
+          }});
+          const res = await fetch('/api/field-config', {{
+            method:'POST', headers:{{'Content-Type':'application/json'}},
+            body: JSON.stringify({{extractors: fcExtractors}})
+          }});
+          const data = await res.json();
+          const msg = document.getElementById('fcMsg');
+          if (data.errors && data.errors.length) {{
+            msg.style.color = 'var(--red)'; msg.textContent = data.errors.join('; ');
+          }} else {{
+            msg.style.color = 'var(--green)'; msg.textContent = 'saved -- reloading...';
+            setTimeout(() => location.reload(), 500);
+          }}
+        }}
+        fcRender();
+        </script>
         """
         active = "exceptions" if status == "EXCEPTION" else "sessions"
         return render("Sessions", active, body)
+
+    @app.route("/api/field-config", methods=["GET", "POST"])
+    def api_field_config():
+        if request.method == "GET":
+            return jsonify({"extractors": fields.load(cfg)})
+        payload = request.get_json(silent=True) or {}
+        errors = fields.save(cfg, payload.get("extractors", []))
+        return jsonify({"ok": not errors, "errors": errors})
 
     @app.route("/sessions/<int:sid>")
     def session_detail(sid):
@@ -293,14 +459,14 @@ def create_app(monitor, cfg):
                 f' &middot; {rec["duration"]}s &middot; {rec["lines"]} lines</p>'
             )
 
-        esc = text.replace("&", "&amp;").replace("<", "&lt;")
+        esc_text = text.replace("&", "&amp;").replace("<", "&lt;")
         body = f"""
         {meta}
         <div class="session-nav">
           <a href="/sessions/{sid-1}">&larr; session #{sid-1} (before)</a>
           <a href="/sessions/{sid+1}">session #{sid+1} (after) &rarr;</a>
         </div>
-        <pre class="term" style="height:70vh">{esc}</pre>
+        <pre class="term" style="height:70vh">{esc_text}</pre>
         """
         return render(f"Session #{sid}", "sessions", body)
 

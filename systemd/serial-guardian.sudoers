@@ -1,0 +1,10 @@
+# Lets the 'pi' user restart/stop exactly this one systemd service,
+# passwordless, and nothing else. Install with:
+#
+#   sudo visudo -cf serial-guardian.sudoers   # validate syntax first
+#   sudo cp serial-guardian.sudoers /etc/sudoers.d/serial-guardian
+#   sudo chmod 440 /etc/sudoers.d/serial-guardian
+#
+# Do not append other commands to this rule -- add a separate, equally
+# narrow file instead if you need to grant something else.
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl restart serial-guardian, /usr/bin/systemctl stop serial-guardian

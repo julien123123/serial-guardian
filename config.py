@@ -20,7 +20,7 @@ LIVE_TAIL_LINES = 400          # lines kept in memory for the live dashboard vie
 # --- How a "clean" session is recognised -------------------------------------
 # A session that reaches this line before it disconnects is considered normal
 # (it comes from gotosleep()/ep.__exit__ completing cleanly).
-GOTOSLEEP_MARKER = "gotosleep(): committed FRAM"
+GOTOSLEEP_MARKER = "ep.__exit__ completed"
 
 # Any of these appearing in a session's output flags it as an EXCEPTION --
 # unless that session was a deliberate STOP (see below), in which case the
@@ -73,3 +73,9 @@ NORMAL_LOG_RETENTION = 500
 # --- Web UI ------------------------------------------------------------
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8080
+
+# --- systemd service control from the web UI --------------------------
+# Must match the unit name installed at /etc/systemd/system/<name>.service
+# (systemd/serial-guardian.service in this repo). Requires the narrowly
+# scoped sudoers rule in systemd/serial-guardian.sudoers -- see README.
+SERVICE_NAME = "serial-guardian"

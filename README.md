@@ -73,7 +73,7 @@ exception-recovery path, never for the manual Stop/Resume buttons.
 sudo apt update
 sudo apt install -y python3-serial python3-flask git
 mkdir -p /home/pi/serial-guardian
-# copy config.py, monitor.py, webapp.py, run.py, systemd/ here
+# copy config.py, monitor.py, webapp.py, fields.py, run.py, systemd/ here
 #   e.g. scp -r ./pi-serial-guardian/* pi@guardian.local:~/serial-guardian/
 ```
 
@@ -182,15 +182,75 @@ next lever to pull is decoupling the web server from the serial reader
 (two processes instead of one, so a slow browser request can never delay
 a read) — not needed unless the above turns out to be insufficient.
 
+## Configurable columns on the Sessions page
+
+Click **"Configure extra columns"** at the bottom of the Sessions page to
+add/edit/remove columns pulled out of each session's raw log with a regex,
+e.g. out of the box:
+
+| column | pulled from | pattern |
+|---|---|---|
+| `REFRESH` | `REFRESH: 8` (the SESSION dump block) | `REFRESH:\s*(\d+)` |
+| `reset_cause` | `State: reset cause = 16, wake up pins [39]` | `reset cause = (\d+)` |
+| `wake_pins` | same line | `wake up pins \[([^\]]*)\]` |
+
+Each pattern needs **exactly one capture group** — that's the value shown
+in the column; the save button rejects anything else with an explanation
+rather than silently misbehaving. Config lives in
+`data/field_config.json`, not `config.py`, specifically so you can change
+it from the browser while mid-debug with no restart. It's also intentionally
+*not* baked into a session's record when the session finishes — values are
+pulled from the raw log at the moment you view the page, so adding a new
+column applies retroactively to sessions already sitting on disk, not just
+ones from that point forward. (Sessions whose raw log has since been
+pruned — see retention below — just show a blank for any column.)
+
+## Service control (Restart / Stop, from the web UI)
+
+Two buttons on the Live page do exactly what they say, via a narrowly
+scoped sudoers rule rather than broad sudo access:
+
+```
+sudo visudo -cf systemd/serial-guardian.sudoers   # validate syntax first
+sudo cp systemd/serial-guardian.sudoers /etc/sudoers.d/serial-guardian
+sudo chmod 440 /etc/sudoers.d/serial-guardian
+```
+
+This grants the `pi` user passwordless rights to exactly
+`systemctl restart serial-guardian` and `systemctl stop serial-guardian` —
+nothing broader. Without this file the buttons still appear but silently
+do nothing (the underlying `sudo -n` call just fails fast rather than
+hanging on a password prompt).
+
+**Restart** briefly interrupts monitoring, then systemd brings the service
+back per the `Restart=always` policy — the page reconnects on its own.
+**Stop** takes the whole tool down (it's the same process serving this
+page), and — because it's a deliberate `systemctl stop`, not a crash —
+systemd will *not* auto-restart it. There's no "Start" button, deliberately:
+nothing can serve that button once the process is down. Bring it back with:
+```
+ssh pi@guardian.local
+sudo systemctl start serial-guardian
+```
+Real use case for Stop, beyond just wanting it off: it releases
+`/dev/ttyACM0` so you can point your own `check.py` or a serial terminal at
+the board directly without the two fighting over the port.
+
+**Worth knowing:** none of this — including Stop — has any authentication.
+Anyone who can reach the Pi on your network can hit these buttons. Fine on
+a trusted home LAN; if that's not your situation, say so and I can add a
+single shared-password gate in front of the whole app.
+
 ## Tuning
 
-Everything above lives in `config.py`:
+Everything in `config.py`:
 - add more `EXCEPTION_MARKERS` if your firmware grows new failure modes
 - `NORMAL_LOG_RETENTION` — how many normal-session logs to keep on disk
   (index entries for pruned sessions stick around either way, just without
   the raw text)
 - `SOFT_RESET_DELAY` / `BOOT_TIMEOUT` / `STOP_SEND_DELAY` if your board
   needs more time to respond
+- `SERVICE_NAME` if you installed the systemd unit under a different name
 
 ## A note on scale
 
