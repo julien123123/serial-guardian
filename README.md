@@ -10,8 +10,12 @@ Zero W (v1), reachable over SSH and a small web dashboard. It also:
 - on `EXCEPTION`, tries to recover the board automatically,
 - lets you halt the board's normal wake/sleep cycle from the web UI and
   resume it later,
+- lets you pause monitoring outright to free the serial port for
+  `mpremote` or a terminal, without taking the web UI down,
 - keeps every `EXCEPTION` / `ANOMALY` / `STOPPED` log forever, and prunes
-  old `NORMAL` logs so the SD card doesn't fill up.
+  old `NORMAL` logs so the SD card doesn't fill up,
+- lets you pull extra columns (like `REFRESH` or `reset cause`) out of
+  each session's raw log with your own regexes, editable from the browser.
 
 Sessions are saved as `data/sessions/000123_STATUS.log`, numbered in order,
 so "the session before/after #123" is just `#122` / `#124` — the id *is*
@@ -205,10 +209,27 @@ column applies retroactively to sessions already sitting on disk, not just
 ones from that point forward. (Sessions whose raw log has since been
 pruned — see retention below — just show a blank for any column.)
 
-## Service control (Restart / Stop, from the web UI)
+## Actions menu (Live page)
 
-Two buttons on the Live page do exactly what they say, via a narrowly
-scoped sudoers rule rather than broad sudo access:
+All the controls live in one **Actions ▾** dropdown now instead of a row
+of panels, grouped by what they actually affect:
+
+**Device** — the existing Stop-device-on-next-update / Resume, from
+before (Ctrl-C / Ctrl-D over serial, see above).
+
+**Monitoring** — *this is almost certainly the one you want for
+mpremote.* **Pause monitoring** tells Guardian to stop touching the
+serial port at all: the next time its read loop notices (within a
+fraction of a second), it closes `/dev/ttyACM0` and stops trying to
+reopen it, so `mpremote` (or a plain serial terminal) can grab it with
+nothing fighting over the port. Nothing gets logged while paused. **Resume
+monitoring** reopens the port and picks back up where it left off. Both
+of these stay within the same process — the web UI keeps working the
+whole time, unlike a full service stop.
+
+**Service** — the heavier hammer: `systemctl restart|stop
+serial-guardian`, via a narrowly scoped sudoers rule rather than broad
+sudo access:
 
 ```
 sudo visudo -cf systemd/serial-guardian.sudoers   # validate syntax first
@@ -216,29 +237,29 @@ sudo cp systemd/serial-guardian.sudoers /etc/sudoers.d/serial-guardian
 sudo chmod 440 /etc/sudoers.d/serial-guardian
 ```
 
-This grants the `pi` user passwordless rights to exactly
-`systemctl restart serial-guardian` and `systemctl stop serial-guardian` —
-nothing broader. Without this file the buttons still appear but silently
-do nothing (the underlying `sudo -n` call just fails fast rather than
-hanging on a password prompt).
+This grants the `pi` user passwordless rights to exactly those two
+commands, nothing broader. Without this file the menu items still appear
+but silently do nothing (`sudo -n` fails fast rather than hanging on a
+password prompt).
 
-**Restart** briefly interrupts monitoring, then systemd brings the service
-back per the `Restart=always` policy — the page reconnects on its own.
+**Restart** briefly interrupts monitoring, then systemd brings the
+service back per `Restart=always` — the page reconnects on its own.
 **Stop** takes the whole tool down (it's the same process serving this
-page), and — because it's a deliberate `systemctl stop`, not a crash —
-systemd will *not* auto-restart it. There's no "Start" button, deliberately:
-nothing can serve that button once the process is down. Bring it back with:
+page), and being a deliberate `systemctl stop`, systemd will *not*
+auto-restart it. There's no "Start" menu item, deliberately: nothing
+could serve it once the process is down. Bring it back with:
 ```
 ssh pi@guardian.local
 sudo systemctl start serial-guardian
 ```
-Real use case for Stop, beyond just wanting it off: it releases
-`/dev/ttyACM0` so you can point your own `check.py` or a serial terminal at
-the board directly without the two fighting over the port.
+In practice, **pausing monitoring is the right tool for using mpremote**
+— it's instant, reversible from the browser, and doesn't take the
+dashboard down with it. Reach for full Stop only if Guardian itself needs
+bouncing (e.g. picking up a code update, or it's genuinely wedged).
 
 **Worth knowing:** none of this — including Stop — has any authentication.
-Anyone who can reach the Pi on your network can hit these buttons. Fine on
-a trusted home LAN; if that's not your situation, say so and I can add a
+Anyone who can reach the Pi on your network can hit these. Fine on a
+trusted home LAN; if that's not your situation, say so and I can add a
 single shared-password gate in front of the whole app.
 
 ## Tuning

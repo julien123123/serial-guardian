@@ -13,6 +13,9 @@ but treats each connect/disconnect cycle as a "session" and:
     a hardware reset over GPIO (if you've wired one up)
   * lets the web UI arm a deliberate "stop on next update" (Ctrl-C, parks
     the board at the REPL) and "resume" (Ctrl-D)
+  * lets the web UI pause/resume monitoring outright -- closing the serial
+    port entirely so an external tool (mpremote, a terminal, whatever) can
+    have it, without needing to touch the systemd service at all
 
 Session files are numbered sequentially (000123_NORMAL.log, ...), so
 "the session before/after" a flagged one is just id-1 / id+1 -- no need to
@@ -55,6 +58,9 @@ class SerialSessionMonitor:
         self._ser = None               # the live Serial object, or None
         self._stop_armed = False       # "halt it the next time it's connected"
         self._currently_halted = False # true while it's sitting at the REPL because we put it there
+
+        # Cross-session state for pausing monitoring entirely (mpremote, etc).
+        self._monitoring_on = True
 
         self._normal_files = collections.deque()  # rolling retention window
 
@@ -100,6 +106,16 @@ class SerialSessionMonitor:
     def run_forever(self):
         cfg = self.cfg
         while True:
+            if not self._monitoring_enabled():
+                # Paused: don't even try to open the port, so something
+                # else (mpremote, a terminal) can grab it freely.
+                with self.lock:
+                    self.connected = False
+                    self._ser = None
+                    self._currently_halted = False
+                time.sleep(cfg.MONITORING_PAUSE_POLL_INTERVAL)
+                continue
+
             try:
                 with serial.Serial(cfg.SERIAL_PORT, cfg.BAUD,
                                     timeout=cfg.SERIAL_READ_TIMEOUT) as ser:
@@ -110,7 +126,10 @@ class SerialSessionMonitor:
                     self._arm_pending_stop_if_requested()
 
                     buf = b""
-                    while True:
+                    # Exits (closing the port via the `with` above) either
+                    # on a real disconnect (caught below) or because
+                    # monitoring got paused mid-session.
+                    while self._monitoring_enabled():
                         n = ser.in_waiting
                         chunk = ser.read(n if n else 1)   # blocks up to timeout when idle
                         if chunk:
@@ -121,12 +140,14 @@ class SerialSessionMonitor:
                         self._check_boot_timeout()
                         self._check_pending_stop(ser)
             except serial.SerialException:
-                with self.lock:
-                    self.connected = False
-                    self._ser = None
-                    self._currently_halted = False   # can't stay "halted" through a disconnect
-                self._finish_session()
-                time.sleep(0.2)
+                pass  # board went to sleep / disconnected -- handled below either way
+
+            with self.lock:
+                self.connected = False
+                self._ser = None
+                self._currently_halted = False   # can't stay "halted" through a disconnect
+            self._finish_session()
+            time.sleep(0.2)
 
     # ------------------------------------------------------------------ #
     # session lifecycle
@@ -303,12 +324,31 @@ class SerialSessionMonitor:
             self._currently_halted = True
 
     # ------------------------------------------------------------------ #
+    # pause / resume monitoring outright (frees the port for mpremote etc)
+    # ------------------------------------------------------------------ #
+    def _monitoring_enabled(self):
+        with self.lock:
+            return self._monitoring_on
+
+    def pause_monitoring(self):
+        """Stop touching the serial port at all -- the run_forever loop
+        notices within one read timeout and closes it, so an external
+        tool can open it right after."""
+        with self.lock:
+            self._monitoring_on = False
+
+    def resume_monitoring(self):
+        with self.lock:
+            self._monitoring_on = True
+
+    # ------------------------------------------------------------------ #
     # read-only helpers for the web UI
     # ------------------------------------------------------------------ #
     def get_status(self):
         with self.lock:
             return {
                 "connected": self.connected,
+                "monitoring": self._monitoring_on,
                 "stats": dict(self.stats),
                 "last_session_id": self.last_session_id,
                 "stop_armed": self._stop_armed,

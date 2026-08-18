@@ -6,9 +6,9 @@ dependencies) since this runs on a Pi Zero W and needs to work even with
 no internet access once it's set up.
 
 NOTE ON EXPOSURE: none of this has any authentication. Everything below
--- including the new "stop the whole service" button -- is reachable by
-anyone who can reach the Pi on your network. Fine on a trusted home LAN,
-worth knowing if that's not your situation.
+-- including "stop the whole service" and "pause monitoring" -- is
+reachable by anyone who can reach the Pi on your network. Fine on a
+trusted home LAN, worth knowing if that's not your situation.
 """
 import json
 import subprocess
@@ -63,7 +63,7 @@ BASE = """
   a:hover { text-decoration: underline; }
   a:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
   code {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
     padding: 0.05rem 0.35rem; font-size: 0.9em;
   }
 
@@ -88,8 +88,12 @@ BASE = """
   .dot.up { background: var(--green); box-shadow: 0 0 6px var(--green); }
   .dot.down { background: var(--red); box-shadow: 0 0 6px var(--red); }
   .dot.halt { background: var(--cyan); box-shadow: 0 0 6px var(--cyan); }
+  .dot.pause { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
 
   main { padding: 1.25rem; max-width: 1080px; margin: 0 auto; }
+
+  .topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; margin-bottom: 1rem; flex-wrap: wrap; }
+  .hint { color: var(--ink-dim); font-size: 0.8rem; }
 
   .stats { display: flex; gap: 0.75rem; margin-bottom: 1rem; flex-wrap: wrap; }
   a.stat-link { text-decoration: none; }
@@ -111,9 +115,29 @@ BASE = """
     border: 1px solid var(--line); border-radius: 6px; padding: 0.45rem 0.9rem; cursor: pointer;
   }
   button.btn:hover { border-color: var(--cyan); color: var(--cyan); }
-  button.btn.danger:hover { border-color: var(--red); color: var(--red); }
   button.btn:disabled { opacity: 0.45; cursor: default; }
-  #stateNote, #svcMsg, .hint { color: var(--ink-dim); font-size: 0.85rem; }
+
+  /* Actions dropdown menu */
+  .menu { position: relative; }
+  .menu-panel {
+    position: absolute; top: calc(100% + 6px); right: 0; z-index: 30;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.45); min-width: 320px; padding: 0.4rem;
+  }
+  .menu-group + .menu-group { border-top: 1px solid var(--line); margin-top: 0.35rem; padding-top: 0.4rem; }
+  .menu-label {
+    color: var(--ink-dim); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.08em;
+    padding: 0.3rem 0.6rem;
+  }
+  .menu-item {
+    display: block; width: 100%; text-align: left; background: none; border: none;
+    color: var(--ink); font-family: var(--mono); font-size: 0.85rem;
+    padding: 0.5rem 0.6rem; border-radius: 6px; cursor: pointer;
+  }
+  .menu-item:hover { background: rgba(255,255,255,0.06); color: var(--cyan); }
+  .menu-item.danger { color: var(--red); opacity: 0.85; }
+  .menu-item.danger:hover { background: rgba(229,90,90,0.12); color: var(--red); opacity: 1; }
+  .menu-hint { color: var(--ink-dim); font-size: 0.72rem; padding: 0.35rem 0.6rem 0.2rem; line-height: 1.45; }
 
   pre.term {
     background: #0a0c0d; border: 1px solid var(--line); border-radius: 6px;
@@ -191,27 +215,36 @@ def create_app(monitor, cfg):
             for k, v in st["stats"].items()
         )
         body = f"""
-        <p id="connLine"></p>
+        <div class="topbar">
+          <div>
+            <p id="connLine" style="margin:0"></p>
+            <p id="subLine" class="hint" style="margin:0.25rem 0 0"></p>
+          </div>
+          <div class="menu" id="actionsMenu">
+            <button class="btn" id="actionsBtn" onclick="toggleMenu(event)">Actions &#9662;</button>
+            <div class="menu-panel" id="actionsPanel" hidden>
+              <div class="menu-group">
+                <div class="menu-label">Device</div>
+                <button class="menu-item" id="stopItem" onclick="doStop()">Stop device on next update</button>
+                <button class="menu-item" id="resumeItem" onclick="doResume()" style="display:none">Resume device</button>
+              </div>
+              <div class="menu-group">
+                <div class="menu-label">Monitoring</div>
+                <button class="menu-item" id="pauseMonItem" onclick="doPauseMon()">Pause monitoring &middot; free port for mpremote</button>
+                <button class="menu-item" id="resumeMonItem" onclick="doResumeMon()" style="display:none">Resume monitoring</button>
+              </div>
+              <div class="menu-group">
+                <div class="menu-label">Service</div>
+                <button class="menu-item" onclick="doService('restart')">Restart service</button>
+                <button class="menu-item danger" onclick="doService('stop')">Stop service</button>
+                <div class="menu-hint">Stop takes down monitoring and this page. Bring it back over SSH:<br>
+                  <code>sudo systemctl start {cfg.SERVICE_NAME}</code></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div class="stats">{stats_html}</div>
-
-        <div class="panel">
-          <div class="controls">
-            <button id="stopBtn" class="btn danger" onclick="doStop()">Stop device on next update</button>
-            <button id="resumeBtn" class="btn" onclick="doResume()" style="display:none">Resume</button>
-            <span id="stateNote"></span>
-          </div>
-        </div>
-
-        <div class="panel">
-          <div class="controls">
-            <button class="btn" onclick="doService('restart')">Restart service</button>
-            <button class="btn danger" onclick="doService('stop')">Stop service</button>
-            <span id="svcMsg"></span>
-          </div>
-          <div class="hint">Stop takes this whole page down along with monitoring &mdash;
-            bring it back over SSH with <code>sudo systemctl start {cfg.SERVICE_NAME}</code></div>
-        </div>
-
         <pre class="term" id="tail"></pre>
         <script>
         function fmt(line) {{
@@ -225,47 +258,60 @@ def create_app(monitor, cfg):
           }}
           return escd;
         }}
+
+        function toggleMenu(e) {{
+          e.stopPropagation();
+          document.getElementById('actionsPanel').hidden = !document.getElementById('actionsPanel').hidden;
+        }}
+        function closeMenu() {{ document.getElementById('actionsPanel').hidden = true; }}
+        document.addEventListener('click', (e) => {{
+          const m = document.getElementById('actionsMenu');
+          if (m && !m.contains(e.target)) closeMenu();
+        }});
+        document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeMenu(); }});
+
         function applyStatus(s) {{
-          const dot = s.halted ? 'halt' : (s.connected ? 'up' : 'down');
-          const label = s.halted ? 'halted at REPL' : (s.connected ? 'connected' : 'disconnected');
+          let dot, label, sub = '';
+          if (!s.monitoring) {{
+            dot = 'pause'; label = 'monitoring paused -- port free for mpremote';
+          }} else if (s.halted) {{
+            dot = 'halt'; label = 'halted at REPL';
+            sub = 'normal wake cycle is paused -- it will not go back to sleep on its own';
+          }} else if (s.connected) {{
+            dot = 'up'; label = 'connected';
+          }} else {{
+            dot = 'down'; label = 'disconnected';
+            if (s.stop_armed) sub = 'armed -- will halt the next time it wakes';
+          }}
           document.getElementById('connLine').innerHTML =
             '<span class="dot ' + dot + '"></span>' + label +
             ' &nbsp;&middot;&nbsp; last session #' + s.last_session_id;
+          document.getElementById('subLine').textContent = sub;
 
-          const stopBtn = document.getElementById('stopBtn');
-          const resumeBtn = document.getElementById('resumeBtn');
-          const note = document.getElementById('stateNote');
-          if (s.halted) {{
-            stopBtn.style.display = 'none';
-            resumeBtn.style.display = 'inline-block';
-            note.textContent = 'normal wake cycle is paused -- it will not go back to sleep on its own';
-          }} else {{
-            resumeBtn.style.display = 'none';
-            stopBtn.style.display = 'inline-block';
-            note.textContent = s.stop_armed ? 'armed -- will halt the next time it wakes' : '';
-          }}
+          document.getElementById('stopItem').style.display = s.halted ? 'none' : 'block';
+          document.getElementById('resumeItem').style.display = s.halted ? 'block' : 'none';
+          document.getElementById('pauseMonItem').style.display = s.monitoring ? 'block' : 'none';
+          document.getElementById('resumeMonItem').style.display = s.monitoring ? 'none' : 'block';
         }}
-        async function doStop() {{
-          document.getElementById('stopBtn').disabled = true;
-          try {{ await fetch('/api/stop', {{method:'POST'}}); }} finally {{
-            document.getElementById('stopBtn').disabled = false;
-          }}
+
+        async function doStop() {{ closeMenu(); await fetch('/api/stop', {{method:'POST'}}); }}
+        async function doResume() {{ closeMenu(); await fetch('/api/resume', {{method:'POST'}}); }}
+        async function doPauseMon() {{
+          closeMenu();
+          if (!confirm('Pause monitoring? This frees {cfg.SERIAL_PORT} for mpremote or another tool -- nothing will be logged until you resume.')) return;
+          await fetch('/api/monitoring/pause', {{method:'POST'}});
         }}
-        async function doResume() {{
-          document.getElementById('resumeBtn').disabled = true;
-          try {{ await fetch('/api/resume', {{method:'POST'}}); }} finally {{
-            document.getElementById('resumeBtn').disabled = false;
-          }}
-        }}
+        async function doResumeMon() {{ closeMenu(); await fetch('/api/monitoring/resume', {{method:'POST'}}); }}
         async function doService(action) {{
+          closeMenu();
           const msgs = {{
             restart: 'Restart the guardian service now? This briefly interrupts monitoring.',
             stop: 'Stop the guardian service? This page goes unreachable until you SSH in and run:\\nsudo systemctl start {cfg.SERVICE_NAME}'
           }};
           if (!confirm(msgs[action])) return;
-          document.getElementById('svcMsg').textContent = action + ' requested...';
           try {{ await fetch('/api/service/' + action, {{method:'POST'}}); }} catch (e) {{}}
         }}
+
         async function poll() {{
           try {{
             const res = await fetch('/api/tail');
@@ -295,6 +341,16 @@ def create_app(monitor, cfg):
     @app.route("/api/resume", methods=["POST"])
     def api_resume():
         monitor.resume()
+        return jsonify(monitor.get_status())
+
+    @app.route("/api/monitoring/pause", methods=["POST"])
+    def api_monitoring_pause():
+        monitor.pause_monitoring()
+        return jsonify(monitor.get_status())
+
+    @app.route("/api/monitoring/resume", methods=["POST"])
+    def api_monitoring_resume():
+        monitor.resume_monitoring()
         return jsonify(monitor.get_status())
 
     # ------------------------------------------------------------------ #

@@ -63,6 +63,10 @@ GPIO_RESET_PULSE = 0.25        # seconds to hold RESET low
 STOP_BYTES = b"\x03\x03"
 STOP_SEND_DELAY = 0.4          # settle time after a fresh connect before sending it
 
+# --- Pause monitoring outright (e.g. to hand the port to mpremote) ---------
+# How often the paused run_forever loop checks whether it's been resumed.
+MONITORING_PAUSE_POLL_INTERVAL = 0.3
+
 # --- Disk usage ------------------------------------------------------------
 # Full raw logs are always kept for EXCEPTION, ANOMALY and STOPPED sessions
 # (rare, and exactly what you want to go back and read). Plain NORMAL
