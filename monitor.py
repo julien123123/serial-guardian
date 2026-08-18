@@ -7,14 +7,27 @@ but treats each connect/disconnect cycle as a "session" and:
 
   * writes every session to its own log file under DATA_DIR/sessions/
   * appends one line of metadata per session to DATA_DIR/index.jsonl
-  * tags each session NORMAL / ANOMALY / EXCEPTION
+  * tags each session NORMAL / ANOMALY / EXCEPTION / STOPPED
   * on EXCEPTION, tries a soft reset (Ctrl-D over serial) and, if that
     doesn't produce a fresh boot within BOOT_TIMEOUT seconds, escalates to
     a hardware reset over GPIO (if you've wired one up)
+  * lets the web UI arm a deliberate "stop on next update" (Ctrl-C, parks
+    the board at the REPL) and "resume" (Ctrl-D)
 
 Session files are numbered sequentially (000123_NORMAL.log, ...), so
 "the session before/after" a flagged one is just id-1 / id+1 -- no need to
 duplicate content, the id is the pointer.
+
+Read loop notes
+----------------
+pyserial's Serial.readline() reads one byte per syscall (it's the default
+io.RawIOBase behaviour). That's fine on a fast laptop but on a single-core
+Pi Zero W it can't always keep up with bursty output (a traceback, or the
+~50 NMEA lines a GPS sync dumps in under a second) -- Python falls behind,
+the kernel's USB CDC buffer fills up, and lines get dropped. The loop below
+blocks for the first byte (so it still sleeps properly when idle) and then
+drains everything else currently buffered in one read() call, which turns
+"one syscall per byte" into "about one syscall per burst".
 """
 
 import collections
@@ -35,8 +48,13 @@ class SerialSessionMonitor:
 
         self.connected = False
         self.live_tail = collections.deque(maxlen=cfg.LIVE_TAIL_LINES)
-        self.stats = {"NORMAL": 0, "ANOMALY": 0, "EXCEPTION": 0}
+        self.stats = {"NORMAL": 0, "ANOMALY": 0, "EXCEPTION": 0, "STOPPED": 0}
         self.last_session_id = 0
+
+        # Cross-session state for the manual stop/resume feature.
+        self._ser = None               # the live Serial object, or None
+        self._stop_armed = False       # "halt it the next time it's connected"
+        self._currently_halted = False # true while it's sitting at the REPL because we put it there
 
         self._normal_files = collections.deque()  # rolling retention window
 
@@ -44,13 +62,13 @@ class SerialSessionMonitor:
         self.index_path = os.path.join(cfg.DATA_DIR, "index.jsonl")
         os.makedirs(self.sessions_dir, exist_ok=True)
 
-        self._reset_next_id_from_disk()
+        self._load_next_id_from_disk()
         self._reset_session_state()
 
     # ------------------------------------------------------------------ #
     # startup helpers
     # ------------------------------------------------------------------ #
-    def _reset_next_id_from_disk(self):
+    def _load_next_id_from_disk(self):
         """Pick up numbering where a previous run left off."""
         self.next_id = 1
         if os.path.exists(self.index_path):
@@ -64,10 +82,15 @@ class SerialSessionMonitor:
         self.last_session_id = self.next_id - 1
 
     def _reset_session_state(self):
+        """Per-session state -- cleared at the start of every session.
+        (Cross-session state like _stop_armed / _currently_halted lives on
+        self directly and is NOT touched here.)"""
         self._lines = []
         self._start_ts = None
         self._is_exception = False
+        self._user_stopped = False     # this session's halt was OUR Ctrl-C, not a real bug
         self._pending_soft_reset_at = None
+        self._stop_send_at = None
         self._awaiting_boot = False
         self._boot_deadline = None
 
@@ -78,18 +101,30 @@ class SerialSessionMonitor:
         cfg = self.cfg
         while True:
             try:
-                with serial.Serial(cfg.SERIAL_PORT, cfg.BAUD, timeout=1) as ser:
+                with serial.Serial(cfg.SERIAL_PORT, cfg.BAUD,
+                                    timeout=cfg.SERIAL_READ_TIMEOUT) as ser:
                     with self.lock:
                         self.connected = True
+                        self._ser = ser
                     self._begin_session()
+                    self._arm_pending_stop_if_requested()
+
+                    buf = b""
                     while True:
-                        raw = ser.readline()
-                        if raw:
-                            self._handle_line(ser, raw.decode(errors="ignore"))
+                        n = ser.in_waiting
+                        chunk = ser.read(n if n else 1)   # blocks up to timeout when idle
+                        if chunk:
+                            buf += chunk
+                            while b"\n" in buf:
+                                raw, buf = buf.split(b"\n", 1)
+                                self._handle_line(ser, raw.decode(errors="ignore") + "\n")
                         self._check_boot_timeout()
+                        self._check_pending_stop(ser)
             except serial.SerialException:
                 with self.lock:
                     self.connected = False
+                    self._ser = None
+                    self._currently_halted = False   # can't stay "halted" through a disconnect
                 self._finish_session()
                 time.sleep(0.2)
 
@@ -100,22 +135,31 @@ class SerialSessionMonitor:
         self._reset_session_state()
         self._start_ts = time.time()
 
+    def _arm_pending_stop_if_requested(self):
+        with self.lock:
+            armed = self._stop_armed
+        if armed:
+            self._stop_send_at = time.time() + self.cfg.STOP_SEND_DELAY
+
     def _handle_line(self, ser, line):
         now = time.time()
 
-        # If this line is a fresh boot banner arriving right after we sent a
-        # soft reset, split it into a new session instead of lumping the
-        # post-reset run into the exception session.
-        if self._awaiting_boot and self.cfg.BOOT_BANNER_MARKER in line:
-            self._awaiting_boot = False
-            self._finish_session()
-            self._begin_session()
+        if self.cfg.BOOT_BANNER_MARKER in line:
+            with self.lock:
+                self._currently_halted = False
+            if self._awaiting_boot:
+                # Fresh boot right after our own soft reset -- split into a
+                # new session so the exception log doesn't get merged with
+                # the clean run that follows it.
+                self._awaiting_boot = False
+                self._finish_session()
+                self._begin_session()
 
         with self.lock:
             self._lines.append(line)
             self.live_tail.append(line.rstrip("\n"))
 
-        if not self._is_exception:
+        if not self._is_exception and not self._user_stopped:
             for marker in self.cfg.EXCEPTION_MARKERS:
                 if marker in line:
                     self._is_exception = True
@@ -131,7 +175,9 @@ class SerialSessionMonitor:
         duration = time.time() - self._start_ts
         text = "".join(self._lines)
 
-        if self._is_exception:
+        if self._user_stopped:
+            status = "STOPPED"
+        elif self._is_exception:
             status = "EXCEPTION"
         elif self.cfg.GOTOSLEEP_MARKER not in text:
             status = "ANOMALY"
@@ -175,7 +221,7 @@ class SerialSessionMonitor:
                 pass
 
     # ------------------------------------------------------------------ #
-    # reset actions
+    # automatic recovery from an unplanned exception
     # ------------------------------------------------------------------ #
     def _trigger_soft_reset(self, ser):
         try:
@@ -211,6 +257,52 @@ class SerialSessionMonitor:
             pass
 
     # ------------------------------------------------------------------ #
+    # deliberate stop / resume -- called from Flask request threads
+    # ------------------------------------------------------------------ #
+    def request_stop(self):
+        """Arm a halt for the next time the board is connected. If it's
+        connected right now, send it immediately too."""
+        with self.lock:
+            self._stop_armed = True
+            ser, live = self._ser, self.connected
+        if live and ser is not None:
+            self._send_stop_keys(ser)
+
+    def resume(self):
+        """Send Ctrl-D right now, if it's currently sitting halted."""
+        with self.lock:
+            self._stop_armed = False
+            ser, live, was_halted = self._ser, self.connected, self._currently_halted
+            self._currently_halted = False
+        if live and ser is not None and was_halted:
+            try:
+                ser.write(b"\x04")
+                ser.flush()
+            except Exception:
+                pass
+
+    def _check_pending_stop(self, ser):
+        if self._stop_send_at and time.time() >= self._stop_send_at:
+            self._send_stop_keys(ser)
+            self._stop_send_at = None
+
+    def _send_stop_keys(self, ser):
+        try:
+            ser.write(self.cfg.STOP_BYTES)
+            ser.flush()
+        except Exception:
+            pass
+        # This session's exception marker(s), if any (MicroPython prints a
+        # KeyboardInterrupt traceback for our own Ctrl-C), are expected --
+        # don't treat it as a bug and don't let the auto-reset logic
+        # override a deliberate stop.
+        self._user_stopped = True
+        self._pending_soft_reset_at = None
+        with self.lock:
+            self._stop_armed = False
+            self._currently_halted = True
+
+    # ------------------------------------------------------------------ #
     # read-only helpers for the web UI
     # ------------------------------------------------------------------ #
     def get_status(self):
@@ -219,6 +311,8 @@ class SerialSessionMonitor:
                 "connected": self.connected,
                 "stats": dict(self.stats),
                 "last_session_id": self.last_session_id,
+                "stop_armed": self._stop_armed,
+                "halted": self._currently_halted,
             }
 
     def get_tail(self):

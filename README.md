@@ -6,10 +6,12 @@ Zero W (v1), reachable over SSH and a small web dashboard. It also:
 - splits the stream into **sessions** (one connect → disconnect cycle of the
   board's USB serial),
 - tags each session `NORMAL` / `ANOMALY` (never reached `gotosleep()`) /
-  `EXCEPTION` (traceback / MemoryError / etc.),
+  `EXCEPTION` (traceback / MemoryError / etc.) / `STOPPED` (you halted it),
 - on `EXCEPTION`, tries to recover the board automatically,
-- keeps every `EXCEPTION` and `ANOMALY` log forever, and prunes old `NORMAL`
-  logs so the SD card doesn't fill up.
+- lets you halt the board's normal wake/sleep cycle from the web UI and
+  resume it later,
+- keeps every `EXCEPTION` / `ANOMALY` / `STOPPED` log forever, and prunes
+  old `NORMAL` logs so the SD card doesn't fill up.
 
 Sessions are saved as `data/sessions/000123_STATUS.log`, numbered in order,
 so "the session before/after #123" is just `#122` / `#124` — the id *is*
@@ -41,11 +43,12 @@ Power the Pi from the **PWR** port with a proper 5V/2.5A supply — the Zero W
 brownout-resets under a flaky supply, which is exactly when you don't want
 to lose monitoring.
 
-Confirm it enumerates:
+Confirm it enumerates (note: the board only shows up while it's actually
+connected — it sleeps most of the time, so `/dev/ttyACM0` will flicker in
+and out roughly once a minute; watch for a bit rather than checking once):
 ```
-ls /dev/ttyACM*
-dmesg | tail
-sudo usermod -aG dialout pi   # then log out/in (or reboot)
+watch -n 1 'ls /dev/ttyACM* 2>&1'
+sudo usermod -aG dialout pi   # then log out/in (or reboot) for it to take effect
 ```
 
 ### Optional: hardware reset line
@@ -61,7 +64,8 @@ rare case where the board hangs *without* reaching the REPL:
 Then in `config.py` set `ENABLE_GPIO_RESET = True` and
 `sudo apt install -y python3-rpi.gpio`. The code drives the pin as an
 open-drain style pull (`OUT LOW` → `IN`/Hi-Z) so it never fights the
-board's own pull-up.
+board's own pull-up. This line is only ever used for the automatic
+exception-recovery path, never for the manual Stop/Resume buttons.
 
 ## 3. Install
 
@@ -91,6 +95,9 @@ sudo systemctl status serial-guardian
 ```
 It'll now survive reboots and restart itself if it ever crashes.
 
+To pick up a code update later: `scp` the changed file over, then
+`sudo systemctl restart serial-guardian`.
+
 ---
 
 ## What "session" and the statuses mean
@@ -109,9 +116,12 @@ wake/sleep cycle of the board (same boundary your original script printed
   did ask to see anything that skips the normal shutdown, so it's flagged
   for you to eyeball rather than silently assumed.
 - **EXCEPTION** — a traceback / `MemoryError` / exception-handler line
-  showed up. This is the one that triggers a reset (see below).
+  showed up unprompted. This is the one that triggers an automatic reset.
+- **STOPPED** — you hit "Stop device on next update" in the web UI. The
+  board's own `Traceback` / `KeyboardInterrupt` from our Ctrl-C is expected
+  here and does **not** count as an EXCEPTION or trigger auto-recovery.
 
-## How the automatic reset works
+## How the automatic reset works (EXCEPTION only)
 
 1. The moment an exception marker is seen, Guardian waits
    `SOFT_RESET_DELAY` (1.5s, to let the traceback finish printing) then
@@ -125,9 +135,52 @@ wake/sleep cycle of the board (same boundary your original script printed
 3. If no boot banner shows up in time (board well and truly stuck) and
    you've wired the optional GPIO line, it pulses RESET.
 
-In your pasted log, crashes were eventually cleared by what looks like a
-watchdog — but only after 173s and 472s of sitting idle at the REPL. With
-Guardian running, recovery happens in a couple of seconds instead.
+In your original pasted log, crashes were eventually cleared by what looks
+like a watchdog — but only after 173s and 472s of sitting idle at the REPL.
+With Guardian running, recovery happens in a couple of seconds instead.
+
+## Stop / Resume
+
+The **"Stop device on next update"** button on the Live page arms a halt:
+- if the board is connected right now, it sends Ctrl-C immediately;
+- if it's asleep, the request is remembered and applied the next time it
+  wakes and connects (no need to leave the browser tab open and wait).
+
+Ctrl-C interrupts whatever's running in `main.py` and drops MicroPython
+into the REPL, same as any other unhandled exception — except here it's
+expected, so it's tagged `STOPPED` rather than `EXCEPTION`, and the
+auto-reset logic leaves it alone. Because the board never reaches
+`gotosleep()`, it stays awake and connected (and drawing power) until you
+either hit **Resume** (sends Ctrl-D, same soft-reboot as the auto-recovery
+path) or reset it some other way.
+
+One caveat, since I don't have your firmware source: this assumes
+`main.py` doesn't catch `KeyboardInterrupt` internally and just carry on.
+If your loop is wrapped in a broad `except:` that swallows it, Ctrl-C won't
+actually stop anything — worth testing once on a session you don't mind
+losing, and if that's the case, let me know how `main.py` structures its
+top-level loop and I can adjust the approach.
+
+## Why lines used to go missing on the Pi but not your laptop
+
+pyserial's `Serial.readline()` reads **one byte per syscall** (the default
+`io.RawIOBase` behaviour) — fine on a fast, multi-core laptop, but a
+single-core Pi Zero W can't always keep up with bursty output: a traceback
+printing fast, or the ~50 GPS NMEA lines your log shows arriving in under a
+second. Python falls behind, the kernel's USB-serial buffer fills up, and
+bytes get silently dropped while the CPU is busy elsewhere (which is more
+likely to happen during exactly the bursty, "anormal" sessions you noticed
+this in).
+
+The read loop now blocks for the first byte (so it still sleeps properly
+between updates) and then drains **everything else currently buffered** in
+a single `read()` call, turning "one syscall per byte" into "about one
+syscall per burst." I tested this against a simulated 600-line burst
+delivered all at once and confirmed every line makes it into the log —
+but if you still see gaps on real hardware at very high line rates, the
+next lever to pull is decoupling the web server from the serial reader
+(two processes instead of one, so a slow browser request can never delay
+a read) — not needed unless the above turns out to be insufficient.
 
 ## Tuning
 
@@ -136,7 +189,8 @@ Everything above lives in `config.py`:
 - `NORMAL_LOG_RETENTION` — how many normal-session logs to keep on disk
   (index entries for pruned sessions stick around either way, just without
   the raw text)
-- `SOFT_RESET_DELAY` / `BOOT_TIMEOUT` if your board needs more time
+- `SOFT_RESET_DELAY` / `BOOT_TIMEOUT` / `STOP_SEND_DELAY` if your board
+  needs more time to respond
 
 ## A note on scale
 

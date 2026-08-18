@@ -12,6 +12,7 @@ STATUS_COLORS = {
     "NORMAL": "#63d68a",
     "ANOMALY": "#e8b64b",
     "EXCEPTION": "#e55a5a",
+    "STOPPED": "#5bc9c9",
 }
 
 BASE = """
@@ -64,6 +65,7 @@ BASE = """
   .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 0.4em; }
   .dot.up { background: var(--green); box-shadow: 0 0 6px var(--green); }
   .dot.down { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  .dot.halt { background: var(--cyan); box-shadow: 0 0 6px var(--cyan); }
 
   main { padding: 1.25rem; max-width: 980px; margin: 0 auto; }
 
@@ -75,9 +77,19 @@ BASE = """
   .stat .n { font-size: 1.4rem; font-weight: 600; }
   .stat .l { color: var(--ink-dim); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; }
 
+  .controls { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem; }
+  button.btn {
+    font-family: var(--mono); font-size: 0.85rem; background: var(--panel); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 6px; padding: 0.45rem 0.9rem; cursor: pointer;
+  }
+  button.btn:hover { border-color: var(--cyan); color: var(--cyan); }
+  button.btn.danger:hover { border-color: var(--red); color: var(--red); }
+  button.btn:disabled { opacity: 0.45; cursor: default; }
+  #stateNote { color: var(--ink-dim); font-size: 0.85rem; }
+
   pre.term {
     background: #0a0c0d; border: 1px solid var(--line); border-radius: 6px;
-    padding: 0.9rem 1rem; height: 60vh; overflow-y: auto;
+    padding: 0.9rem 1rem; height: 58vh; overflow-y: auto;
     white-space: pre-wrap; word-break: break-word; margin: 0;
   }
   pre.term .l-exc { border-left: 3px solid var(--red); padding-left: 0.5em; color: #f3a9a9; }
@@ -133,17 +145,19 @@ def create_app(monitor, cfg):
     @app.route("/")
     def live():
         st = monitor.get_status()
-        dot = "up" if st["connected"] else "down"
-        label = "connected" if st["connected"] else "disconnected"
         stats_html = "".join(
             f'<div class="stat"><div class="n" style="color:{STATUS_COLORS[k]}">{v}</div>'
             f'<div class="l">{k}</div></div>'
             for k, v in st["stats"].items()
         )
         body = f"""
-        <p><span class="dot {dot}"></span>{label}
-           &nbsp;&middot;&nbsp; last session #{st['last_session_id']}</p>
+        <p id="connLine"></p>
         <div class="stats">{stats_html}</div>
+        <div class="controls">
+          <button id="stopBtn" class="btn danger" onclick="doStop()">Stop device on next update</button>
+          <button id="resumeBtn" class="btn" onclick="doResume()" style="display:none">Resume</button>
+          <span id="stateNote"></span>
+        </div>
         <pre class="term" id="tail"></pre>
         <script>
         function fmt(line) {{
@@ -157,6 +171,38 @@ def create_app(monitor, cfg):
           }}
           return esc;
         }}
+        function applyStatus(s) {{
+          const dot = s.halted ? 'halt' : (s.connected ? 'up' : 'down');
+          const label = s.halted ? 'halted at REPL' : (s.connected ? 'connected' : 'disconnected');
+          document.getElementById('connLine').innerHTML =
+            '<span class="dot ' + dot + '"></span>' + label +
+            ' &nbsp;&middot;&nbsp; last session #' + s.last_session_id;
+
+          const stopBtn = document.getElementById('stopBtn');
+          const resumeBtn = document.getElementById('resumeBtn');
+          const note = document.getElementById('stateNote');
+          if (s.halted) {{
+            stopBtn.style.display = 'none';
+            resumeBtn.style.display = 'inline-block';
+            note.textContent = 'normal wake cycle is paused -- it will not go back to sleep on its own';
+          }} else {{
+            resumeBtn.style.display = 'none';
+            stopBtn.style.display = 'inline-block';
+            note.textContent = s.stop_armed ? 'armed -- will halt the next time it wakes' : '';
+          }}
+        }}
+        async function doStop() {{
+          document.getElementById('stopBtn').disabled = true;
+          try {{ await fetch('/api/stop', {{method:'POST'}}); }} finally {{
+            document.getElementById('stopBtn').disabled = false;
+          }}
+        }}
+        async function doResume() {{
+          document.getElementById('resumeBtn').disabled = true;
+          try {{ await fetch('/api/resume', {{method:'POST'}}); }} finally {{
+            document.getElementById('resumeBtn').disabled = false;
+          }}
+        }}
         async function poll() {{
           try {{
             const res = await fetch('/api/tail');
@@ -165,6 +211,7 @@ def create_app(monitor, cfg):
             const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
             box.innerHTML = data.tail.map(fmt).join('\\n');
             if (atBottom) box.scrollTop = box.scrollHeight;
+            applyStatus(data.status);
           }} catch (e) {{ /* pi rebooting, wifi hiccup, etc -- just retry */ }}
           setTimeout(poll, 1500);
         }}
@@ -177,10 +224,20 @@ def create_app(monitor, cfg):
     def api_tail():
         return jsonify({"tail": monitor.get_tail(), "status": monitor.get_status()})
 
+    @app.route("/api/stop", methods=["POST"])
+    def api_stop():
+        monitor.request_stop()
+        return jsonify(monitor.get_status())
+
+    @app.route("/api/resume", methods=["POST"])
+    def api_resume():
+        monitor.resume()
+        return jsonify(monitor.get_status())
+
     @app.route("/sessions")
     def sessions():
         status = request.args.get("status")
-        if status not in (None, "NORMAL", "ANOMALY", "EXCEPTION"):
+        if status not in (None, "NORMAL", "ANOMALY", "EXCEPTION", "STOPPED"):
             status = None
         records = monitor.recent_sessions(n=200, status=status)
 
@@ -190,8 +247,8 @@ def create_app(monitor, cfg):
             return f'<a class="{cls}" href="{href}">{label}</a>'
 
         filters = (
-            link("All", None) + link("Normal", "NORMAL")
-            + link("Anomaly", "ANOMALY") + link("Exception", "EXCEPTION")
+            link("All", None) + link("Normal", "NORMAL") + link("Anomaly", "ANOMALY")
+            + link("Exception", "EXCEPTION") + link("Stopped", "STOPPED")
         )
 
         rows = ""
@@ -236,9 +293,7 @@ def create_app(monitor, cfg):
                 f' &middot; {rec["duration"]}s &middot; {rec["lines"]} lines</p>'
             )
 
-        esc = (
-            text.replace("&", "&amp;").replace("<", "&lt;")
-        )
+        esc = text.replace("&", "&amp;").replace("<", "&lt;")
         body = f"""
         {meta}
         <div class="session-nav">
