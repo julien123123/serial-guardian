@@ -12,6 +12,8 @@ Zero W (v1), reachable over SSH and a small web dashboard. It also:
   resume it later,
 - lets you pause monitoring outright to free the serial port for
   `mpremote` or a terminal, without taking the web UI down,
+- lets you reset the device unconditionally, and erase all session
+  history with one click,
 - keeps every `EXCEPTION` / `ANOMALY` / `STOPPED` log forever, and prunes
   old `NORMAL` logs so the SD card doesn't fill up,
 - lets you pull extra columns (like `REFRESH` or `reset cause`) out of
@@ -209,23 +211,29 @@ column applies retroactively to sessions already sitting on disk, not just
 ones from that point forward. (Sessions whose raw log has since been
 pruned — see retention below — just show a blank for any column.)
 
-## Actions menu (Live page)
+## Actions toolbar (Live page)
 
-All the controls live in one **Actions ▾** dropdown now instead of a row
-of panels, grouped by what they actually affect:
+A short, right-aligned toolbar, grouped by what each part affects. Buttons
+are single words; hover any of them for the full explanation.
 
-**Device** — the existing Stop-device-on-next-update / Resume, from
-before (Ctrl-C / Ctrl-D over serial, see above).
+**Device** — **Stop** halts the board at the REPL on its next update
+(Ctrl-C) so it stays awake instead of sleeping; **Resume** brings it back
+(Ctrl-D). **Reset** is new and unconditional: reboots the board right now
+regardless of whether it's halted, running normally, or asleep. If it's
+connected, that's the same soft-reset keystrokes used for automatic
+exception recovery (and the same escalation to the hardware line if it
+doesn't come back); if it's asleep and not connected at all, soft reset
+over serial isn't possible, so only the hardware line (if wired) can do
+anything.
 
-**Monitoring** — *this is almost certainly the one you want for
-mpremote.* **Pause monitoring** tells Guardian to stop touching the
-serial port at all: the next time its read loop notices (within a
-fraction of a second), it closes `/dev/ttyACM0` and stops trying to
-reopen it, so `mpremote` (or a plain serial terminal) can grab it with
-nothing fighting over the port. Nothing gets logged while paused. **Resume
-monitoring** reopens the port and picks back up where it left off. Both
-of these stay within the same process — the web UI keeps working the
-whole time, unlike a full service stop.
+**Monitoring** — *this is the one you want for mpremote.* **Pause** tells
+Guardian to stop touching the serial port entirely: the next time its read
+loop notices (within a fraction of a second), it closes `/dev/ttyACM0` and
+stops trying to reopen it, so `mpremote` (or a plain serial terminal) can
+grab it with nothing fighting over the port. Nothing gets logged while
+paused. **Resume** reopens the port and picks back up where it left off.
+Both stay within the same process — the web UI keeps working the whole
+time, unlike a full service stop.
 
 **Service** — the heavier hammer: `systemctl restart|stop
 serial-guardian`, via a narrowly scoped sudoers rule rather than broad
@@ -238,29 +246,33 @@ sudo chmod 440 /etc/sudoers.d/serial-guardian
 ```
 
 This grants the `pi` user passwordless rights to exactly those two
-commands, nothing broader. Without this file the menu items still appear
-but silently do nothing (`sudo -n` fails fast rather than hanging on a
-password prompt).
-
-**Restart** briefly interrupts monitoring, then systemd brings the
-service back per `Restart=always` — the page reconnects on its own.
-**Stop** takes the whole tool down (it's the same process serving this
-page), and being a deliberate `systemctl stop`, systemd will *not*
-auto-restart it. There's no "Start" menu item, deliberately: nothing
-could serve it once the process is down. Bring it back with:
+commands, nothing broader. Without this file the buttons still appear but
+silently do nothing (`sudo -n` fails fast rather than hanging on a
+password prompt). **Restart** briefly interrupts monitoring, then systemd
+brings the service back per `Restart=always` — the page reconnects on its
+own. **Stop** takes the whole tool down (it's the same process serving
+this page), and being a deliberate `systemctl stop`, systemd will *not*
+auto-restart it. There's no "Start" button, deliberately: nothing could
+serve it once the process is down. Bring it back with:
 ```
 ssh pi@guardian.local
 sudo systemctl start serial-guardian
 ```
 In practice, **pausing monitoring is the right tool for using mpremote**
-— it's instant, reversible from the browser, and doesn't take the
-dashboard down with it. Reach for full Stop only if Guardian itself needs
-bouncing (e.g. picking up a code update, or it's genuinely wedged).
+— instant, reversible from the browser, doesn't take the dashboard down
+with it. Reach for full Stop only if Guardian itself needs bouncing.
 
-**Worth knowing:** none of this — including Stop — has any authentication.
-Anyone who can reach the Pi on your network can hit these. Fine on a
-trusted home LAN; if that's not your situation, say so and I can add a
-single shared-password gate in front of the whole app.
+**Data** — **Erase** permanently deletes every session log and the index,
+and restarts numbering at #1. There's a confirm dialog because it can't be
+undone. (One honest caveat: if a session happens to finish at the exact
+instant you click Erase, its file can land back on disk right after —
+a rare, harmless race, not worth adding lock contention on the serial
+read path to fully close.)
+
+**Worth knowing:** none of this — including Stop and Erase — has any
+authentication. Anyone who can reach the Pi on your network can hit these.
+Fine on a trusted home LAN; if that's not your situation, say so and I can
+add a single shared-password gate in front of the whole app.
 
 ## Tuning
 

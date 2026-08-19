@@ -6,9 +6,9 @@ dependencies) since this runs on a Pi Zero W and needs to work even with
 no internet access once it's set up.
 
 NOTE ON EXPOSURE: none of this has any authentication. Everything below
--- including "stop the whole service" and "pause monitoring" -- is
-reachable by anyone who can reach the Pi on your network. Fine on a
-trusted home LAN, worth knowing if that's not your situation.
+-- including "stop the whole service", "pause monitoring", and "erase all
+sessions" -- is reachable by anyone who can reach the Pi on your network.
+Fine on a trusted home LAN, worth knowing if that's not your situation.
 """
 import json
 import subprocess
@@ -92,7 +92,7 @@ BASE = """
 
   main { padding: 1.25rem; max-width: 1080px; margin: 0 auto; }
 
-  .topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; margin-bottom: 1rem; flex-wrap: wrap; }
+  .topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; }
   .hint { color: var(--ink-dim); font-size: 0.8rem; }
 
   .stats { display: flex; gap: 0.75rem; margin-bottom: 1rem; flex-wrap: wrap; }
@@ -117,27 +117,24 @@ BASE = """
   button.btn:hover { border-color: var(--cyan); color: var(--cyan); }
   button.btn:disabled { opacity: 0.45; cursor: default; }
 
-  /* Actions dropdown menu */
-  .menu { position: relative; }
-  .menu-panel {
-    position: absolute; top: calc(100% + 6px); right: 0; z-index: 30;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-    box-shadow: 0 10px 28px rgba(0,0,0,0.45); min-width: 320px; padding: 0.4rem;
+  /* Right-aligned action toolbar: one-word label per group, short buttons,
+     full explanation lives in the title= tooltip rather than on the page. */
+  .toolbar { display: flex; gap: 0.9rem; flex-wrap: wrap; justify-content: flex-end; }
+  .tb-group {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 0.3rem;
+    padding-left: 0.9rem; border-left: 1px solid var(--line);
   }
-  .menu-group + .menu-group { border-top: 1px solid var(--line); margin-top: 0.35rem; padding-top: 0.4rem; }
-  .menu-label {
-    color: var(--ink-dim); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.08em;
-    padding: 0.3rem 0.6rem;
+  .tb-group:first-child { padding-left: 0; border-left: none; }
+  .tb-label {
+    font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-dim);
   }
-  .menu-item {
-    display: block; width: 100%; text-align: left; background: none; border: none;
-    color: var(--ink); font-family: var(--mono); font-size: 0.85rem;
-    padding: 0.5rem 0.6rem; border-radius: 6px; cursor: pointer;
+  .tb-buttons { display: flex; gap: 0.35rem; }
+  .tb-btn {
+    font-family: var(--mono); font-size: 0.78rem; background: var(--panel); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 5px; padding: 0.3rem 0.6rem; cursor: pointer;
   }
-  .menu-item:hover { background: rgba(255,255,255,0.06); color: var(--cyan); }
-  .menu-item.danger { color: var(--red); opacity: 0.85; }
-  .menu-item.danger:hover { background: rgba(229,90,90,0.12); color: var(--red); opacity: 1; }
-  .menu-hint { color: var(--ink-dim); font-size: 0.72rem; padding: 0.35rem 0.6rem 0.2rem; line-height: 1.45; }
+  .tb-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+  .tb-btn.danger:hover { border-color: var(--red); color: var(--red); }
 
   pre.term {
     background: #0a0c0d; border: 1px solid var(--line); border-radius: 6px;
@@ -214,31 +211,58 @@ def create_app(monitor, cfg):
             f'<div class="l">{k}</div></div></a>'
             for k, v in st["stats"].items()
         )
+        service_stop_title = (
+            "Stop the guardian service entirely. This page goes down too.\n"
+            f"Restart over SSH: sudo systemctl start {cfg.SERVICE_NAME}"
+        )
         body = f"""
         <div class="topbar">
           <div>
             <p id="connLine" style="margin:0"></p>
             <p id="subLine" class="hint" style="margin:0.25rem 0 0"></p>
           </div>
-          <div class="menu" id="actionsMenu">
-            <button class="btn" id="actionsBtn" onclick="toggleMenu(event)">Actions &#9662;</button>
-            <div class="menu-panel" id="actionsPanel" hidden>
-              <div class="menu-group">
-                <div class="menu-label">Device</div>
-                <button class="menu-item" id="stopItem" onclick="doStop()">Stop device on next update</button>
-                <button class="menu-item" id="resumeItem" onclick="doResume()" style="display:none">Resume device</button>
+          <div class="toolbar">
+            <div class="tb-group">
+              <div class="tb-label">Device</div>
+              <div class="tb-buttons">
+                <button id="stopItem" class="tb-btn"
+                        title="Send Ctrl-C so the board halts at the REPL on its next update instead of sleeping"
+                        onclick="doStop()">Stop</button>
+                <button id="resumeItem" class="tb-btn" style="display:none"
+                        title="Send Ctrl-D to resume normal operation"
+                        onclick="doResume()">Resume</button>
+                <button class="tb-btn"
+                        title="Reboot the board now, whatever state it's in (halted, running, or asleep -- uses the hardware reset line if one is wired and it's not connected)"
+                        onclick="doResetDevice()">Reset</button>
               </div>
-              <div class="menu-group">
-                <div class="menu-label">Monitoring</div>
-                <button class="menu-item" id="pauseMonItem" onclick="doPauseMon()">Pause monitoring &middot; free port for mpremote</button>
-                <button class="menu-item" id="resumeMonItem" onclick="doResumeMon()" style="display:none">Resume monitoring</button>
+            </div>
+            <div class="tb-group">
+              <div class="tb-label">Monitoring</div>
+              <div class="tb-buttons">
+                <button id="pauseMonItem" class="tb-btn"
+                        title="Stop touching the serial port so mpremote or a terminal can use it. Nothing is logged while paused."
+                        onclick="doPauseMon()">Pause</button>
+                <button id="resumeMonItem" class="tb-btn" style="display:none"
+                        title="Reopen the serial port and resume monitoring"
+                        onclick="doResumeMon()">Resume</button>
               </div>
-              <div class="menu-group">
-                <div class="menu-label">Service</div>
-                <button class="menu-item" onclick="doService('restart')">Restart service</button>
-                <button class="menu-item danger" onclick="doService('stop')">Stop service</button>
-                <div class="menu-hint">Stop takes down monitoring and this page. Bring it back over SSH:<br>
-                  <code>sudo systemctl start {cfg.SERVICE_NAME}</code></div>
+            </div>
+            <div class="tb-group">
+              <div class="tb-label">Service</div>
+              <div class="tb-buttons">
+                <button class="tb-btn"
+                        title="Restart the guardian service. Brief interruption, reconnects on its own."
+                        onclick="doService('restart')">Restart</button>
+                <button class="tb-btn danger" title="{service_stop_title}"
+                        onclick="doService('stop')">Stop</button>
+              </div>
+            </div>
+            <div class="tb-group">
+              <div class="tb-label">Data</div>
+              <div class="tb-buttons">
+                <button class="tb-btn danger"
+                        title="Permanently delete every session log and the index. Cannot be undone."
+                        onclick="doEraseSessions()">Erase</button>
               </div>
             </div>
           </div>
@@ -259,17 +283,6 @@ def create_app(monitor, cfg):
           return escd;
         }}
 
-        function toggleMenu(e) {{
-          e.stopPropagation();
-          document.getElementById('actionsPanel').hidden = !document.getElementById('actionsPanel').hidden;
-        }}
-        function closeMenu() {{ document.getElementById('actionsPanel').hidden = true; }}
-        document.addEventListener('click', (e) => {{
-          const m = document.getElementById('actionsMenu');
-          if (m && !m.contains(e.target)) closeMenu();
-        }});
-        document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeMenu(); }});
-
         function applyStatus(s) {{
           let dot, label, sub = '';
           if (!s.monitoring) {{
@@ -288,28 +301,34 @@ def create_app(monitor, cfg):
             ' &nbsp;&middot;&nbsp; last session #' + s.last_session_id;
           document.getElementById('subLine').textContent = sub;
 
-          document.getElementById('stopItem').style.display = s.halted ? 'none' : 'block';
-          document.getElementById('resumeItem').style.display = s.halted ? 'block' : 'none';
-          document.getElementById('pauseMonItem').style.display = s.monitoring ? 'block' : 'none';
-          document.getElementById('resumeMonItem').style.display = s.monitoring ? 'none' : 'block';
+          document.getElementById('stopItem').style.display = s.halted ? 'none' : 'inline-block';
+          document.getElementById('resumeItem').style.display = s.halted ? 'inline-block' : 'none';
+          document.getElementById('pauseMonItem').style.display = s.monitoring ? 'inline-block' : 'none';
+          document.getElementById('resumeMonItem').style.display = s.monitoring ? 'none' : 'inline-block';
         }}
 
-        async function doStop() {{ closeMenu(); await fetch('/api/stop', {{method:'POST'}}); }}
-        async function doResume() {{ closeMenu(); await fetch('/api/resume', {{method:'POST'}}); }}
+        async function doStop() {{ await fetch('/api/stop', {{method:'POST'}}); }}
+        async function doResume() {{ await fetch('/api/resume', {{method:'POST'}}); }}
+        async function doResetDevice() {{
+          if (!confirm('Reset the device now?')) return;
+          await fetch('/api/device/reset', {{method:'POST'}});
+        }}
         async function doPauseMon() {{
-          closeMenu();
           if (!confirm('Pause monitoring? This frees {cfg.SERIAL_PORT} for mpremote or another tool -- nothing will be logged until you resume.')) return;
           await fetch('/api/monitoring/pause', {{method:'POST'}});
         }}
-        async function doResumeMon() {{ closeMenu(); await fetch('/api/monitoring/resume', {{method:'POST'}}); }}
+        async function doResumeMon() {{ await fetch('/api/monitoring/resume', {{method:'POST'}}); }}
         async function doService(action) {{
-          closeMenu();
           const msgs = {{
             restart: 'Restart the guardian service now? This briefly interrupts monitoring.',
             stop: 'Stop the guardian service? This page goes unreachable until you SSH in and run:\\nsudo systemctl start {cfg.SERVICE_NAME}'
           }};
           if (!confirm(msgs[action])) return;
           try {{ await fetch('/api/service/' + action, {{method:'POST'}}); }} catch (e) {{}}
+        }}
+        async function doEraseSessions() {{
+          if (!confirm('Permanently erase ALL session logs and the index? This cannot be undone.')) return;
+          await fetch('/api/sessions/erase', {{method:'POST'}});
         }}
 
         async function poll() {{
@@ -343,6 +362,11 @@ def create_app(monitor, cfg):
         monitor.resume()
         return jsonify(monitor.get_status())
 
+    @app.route("/api/device/reset", methods=["POST"])
+    def api_device_reset():
+        monitor.reset_device()
+        return jsonify(monitor.get_status())
+
     @app.route("/api/monitoring/pause", methods=["POST"])
     def api_monitoring_pause():
         monitor.pause_monitoring()
@@ -351,6 +375,11 @@ def create_app(monitor, cfg):
     @app.route("/api/monitoring/resume", methods=["POST"])
     def api_monitoring_resume():
         monitor.resume_monitoring()
+        return jsonify(monitor.get_status())
+
+    @app.route("/api/sessions/erase", methods=["POST"])
+    def api_sessions_erase():
+        monitor.erase_all_sessions()
         return jsonify(monitor.get_status())
 
     # ------------------------------------------------------------------ #

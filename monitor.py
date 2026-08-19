@@ -12,10 +12,12 @@ but treats each connect/disconnect cycle as a "session" and:
     doesn't produce a fresh boot within BOOT_TIMEOUT seconds, escalates to
     a hardware reset over GPIO (if you've wired one up)
   * lets the web UI arm a deliberate "stop on next update" (Ctrl-C, parks
-    the board at the REPL) and "resume" (Ctrl-D)
+    the board at the REPL), "resume" (Ctrl-D), and an unconditional
+    "reset now" that works regardless of current state
   * lets the web UI pause/resume monitoring outright -- closing the serial
     port entirely so an external tool (mpremote, a terminal, whatever) can
     have it, without needing to touch the systemd service at all
+  * lets the web UI erase all session history and start numbering over
 
 Session files are numbered sequentially (000123_NORMAL.log, ...), so
 "the session before/after" a flagged one is just id-1 / id+1 -- no need to
@@ -290,7 +292,10 @@ class SerialSessionMonitor:
             self._send_stop_keys(ser)
 
     def resume(self):
-        """Send Ctrl-D right now, if it's currently sitting halted."""
+        """Send Ctrl-D right now, if it's currently sitting halted (i.e.
+        this is specifically the counterpart to request_stop() -- for an
+        unconditional "reboot it now regardless of state", see
+        reset_device() below)."""
         with self.lock:
             self._stop_armed = False
             ser, live, was_halted = self._ser, self.connected, self._currently_halted
@@ -301,6 +306,31 @@ class SerialSessionMonitor:
                 ser.flush()
             except Exception:
                 pass
+
+    def reset_device(self):
+        """Manual reset, available any time regardless of current state.
+        If the board is connected right now, this sends the same
+        soft-reset keystrokes used for automatic exception recovery, and
+        the normal boot-timeout escalation to the hardware reset line (if
+        configured) still applies if it doesn't come back. If it's not
+        connected at all (asleep, or not enumerating), soft reset over
+        serial isn't possible -- the hardware line, if wired, is fired
+        immediately instead since it doesn't need the USB link."""
+        with self.lock:
+            ser, live = self._ser, self.connected
+        if live and ser is not None:
+            try:
+                ser.write(self.cfg.SOFT_RESET_BYTES)
+                ser.flush()
+            except Exception:
+                pass
+            self._awaiting_boot = True
+            self._boot_deadline = time.time() + self.cfg.BOOT_TIMEOUT
+            with self.lock:
+                self._currently_halted = False
+                self._stop_armed = False
+        else:
+            self._hard_reset()
 
     def _check_pending_stop(self, ser):
         if self._stop_send_at and time.time() >= self._stop_send_at:
@@ -401,3 +431,27 @@ class SerialSessionMonitor:
             return None
         with open(matches[0]) as f:
             return f.read()
+
+    # ------------------------------------------------------------------ #
+    # erase all history -- called from a Flask request thread
+    # ------------------------------------------------------------------ #
+    def erase_all_sessions(self):
+        """Delete every session log and the index, and reset numbering
+        back to #1. Doesn't touch the live connection or in-progress
+        session -- if one finishes at the exact moment this runs, it may
+        land back on disk right after (a harmless, rare race; not worth
+        adding lock contention on the serial read path to close it)."""
+        for f in glob.glob(os.path.join(self.sessions_dir, "*.log")):
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+        try:
+            os.remove(self.index_path)
+        except FileNotFoundError:
+            pass
+        with self.lock:
+            self.stats = {"NORMAL": 0, "ANOMALY": 0, "EXCEPTION": 0, "STOPPED": 0}
+            self.next_id = 1
+            self.last_session_id = 0
+        self._normal_files.clear()
