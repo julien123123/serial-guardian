@@ -389,6 +389,14 @@ class SerialSessionMonitor:
         with self.lock:
             return list(self.live_tail)
 
+    def resize_live_tail(self):
+        """Rebuild the live-tail buffer to the current cfg.LIVE_TAIL_LINES
+        (a plain deque's maxlen can't be changed after creation). Cheap
+        and safe to call any time -- e.g. after a Settings-page save,
+        whether or not that particular value actually changed."""
+        with self.lock:
+            self.live_tail = collections.deque(self.live_tail, maxlen=self.cfg.LIVE_TAIL_LINES)
+
     def recent_sessions(self, n=100, status=None):
         if not os.path.exists(self.index_path):
             return []

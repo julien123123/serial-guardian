@@ -6,9 +6,10 @@ dependencies) since this runs on a Pi Zero W and needs to work even with
 no internet access once it's set up.
 
 NOTE ON EXPOSURE: none of this has any authentication. Everything below
--- including "stop the whole service", "pause monitoring", and "erase all
-sessions" -- is reachable by anyone who can reach the Pi on your network.
-Fine on a trusted home LAN, worth knowing if that's not your situation.
+-- including "stop the whole service", "pause monitoring", "erase all
+sessions", and now the Settings page -- is reachable by anyone who can
+reach the Pi on your network. Fine on a trusted home LAN, worth knowing
+if that's not your situation.
 """
 import json
 import subprocess
@@ -18,6 +19,7 @@ import time
 from flask import Flask, jsonify, render_template_string, request
 
 import fields
+import settings
 
 STATUS_COLORS = {
     "NORMAL": "#63d68a",
@@ -166,12 +168,30 @@ BASE = """
   .meta b { color: var(--ink); }
   footer { text-align: center; color: var(--ink-dim); padding: 2rem 1rem; font-size: 0.78rem; }
 
-  details.fc summary { cursor: pointer; color: var(--ink-dim); margin-bottom: 0.6rem; }
-  details.fc[open] summary { color: var(--ink); }
   .fc table input {
     font-family: var(--mono); background: var(--bg); color: var(--ink);
     border: 1px solid var(--line); border-radius: 4px; padding: 0.3rem 0.5rem; width: 100%;
   }
+
+  h2.section-title { font-size: 0.95rem; margin: 1.6rem 0 0.9rem; color: var(--ink); }
+  h2.section-title:first-child { margin-top: 0; }
+  .settings-section { margin-bottom: 1.6rem; }
+  .settings-section-label {
+    font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-dim);
+    border-bottom: 1px solid var(--line); padding-bottom: 0.4rem; margin-bottom: 0.9rem;
+  }
+  .field-row { display: block; margin-bottom: 1rem; max-width: 520px; }
+  .field-row.checkbox { display: flex; align-items: center; gap: 0.6rem; max-width: none; }
+  .field-row.checkbox .field-label { margin-bottom: 0; }
+  .field-label { font-size: 0.82rem; color: var(--ink); margin-bottom: 0.3rem; }
+  .field-help { font-size: 0.75rem; color: var(--ink-dim); margin-top: 0.3rem; line-height: 1.4; }
+  .field-row input[type=text], .field-row input[type=number], .field-row textarea {
+    width: 100%; font-family: var(--mono); font-size: 0.85rem; background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 5px; padding: 0.4rem 0.6rem;
+  }
+  .field-row textarea { min-height: 4.5em; resize: vertical; }
+  table.readonly-table td { font-size: 0.85rem; }
+  table.readonly-table td.key { color: var(--ink-dim); white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -180,7 +200,7 @@ BASE = """
   <nav>
     <a href="/" class="{{ 'active' if active=='live' else '' }}">Live</a>
     <a href="/sessions" class="{{ 'active' if active=='sessions' else '' }}">Sessions</a>
-    <a href="/sessions?status=EXCEPTION" class="{{ 'active' if active=='exceptions' else '' }}">Exceptions</a>
+    <a href="/settings" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
   </nav>
 </header>
 <main>
@@ -215,6 +235,7 @@ def create_app(monitor, cfg):
             "Stop the guardian service entirely. This page goes down too.\n"
             f"Restart over SSH: sudo systemctl start {cfg.SERVICE_NAME}"
         )
+        exc_markers_json = json.dumps(cfg.EXCEPTION_MARKERS)
         body = f"""
         <div class="topbar">
           <div>
@@ -271,10 +292,10 @@ def create_app(monitor, cfg):
         <div class="stats">{stats_html}</div>
         <pre class="term" id="tail"></pre>
         <script>
+        const EXC_MARKERS = {exc_markers_json};
         function fmt(line) {{
           const escd = line.replace(/&/g,'&amp;').replace(/</g,'&lt;');
-          if (line.includes('Traceback') || line.includes('MemoryError') ||
-              line.includes('Exception handler: caught exception')) {{
+          if (EXC_MARKERS.some(m => line.includes(m))) {{
             return '<span class="l-exc">' + escd + '</span>';
           }}
           if (line.includes('{cfg.GOTOSLEEP_MARKER}')) {{
@@ -408,7 +429,7 @@ def create_app(monitor, cfg):
         return jsonify({"ok": True, "action": "stop"})
 
     # ------------------------------------------------------------------ #
-    # Sessions page, with configurable extra columns
+    # Sessions page
     # ------------------------------------------------------------------ #
     @app.route("/sessions")
     def sessions():
@@ -447,27 +468,145 @@ def create_app(monitor, cfg):
                 f'</tr>'
             )
 
-        fc_rows_json = json.dumps(extractors)
         body = f"""
         <div class="filters">{filters}</div>
         <table>
           <tr><th>id</th><th>status</th><th>duration</th><th>size</th>{extra_headers}<th></th></tr>
           {rows or f'<tr><td colspan="{5 + len(extractors)}">no sessions recorded yet</td></tr>'}
         </table>
+        <p class="hint" style="margin-top:0.9rem">Extra columns are configured on the
+          <a href="/settings">Settings</a> page.</p>
+        """
+        return render("Sessions", "sessions", body)
 
-        <details class="fc panel" style="margin-top:1.25rem">
-          <summary>Configure extra columns ({len(extractors)})</summary>
+    @app.route("/sessions/<int:sid>")
+    def session_detail(sid):
+        rec = monitor.find_record(sid)
+        text = monitor.read_session_text(sid)
+        if text is None:
+            body = f"<p>Session #{sid} has no log on disk"
+            body += " (pruned, it was a NORMAL session outside the retention window)." if rec else " -- unknown id."
+            body += '</p><p><a href="/sessions">&larr; back to sessions</a></p>'
+            return render(f"Session #{sid}", "sessions", body)
+
+        status = rec["status"] if rec else "?"
+        color = STATUS_COLORS.get(status, "#888")
+        meta = ""
+        if rec:
+            meta = (
+                f'<p class="meta"><b>#{rec["id"]}</b> &middot; '
+                f'<span class="badge" style="background:{color}22;color:{color}">{status}</span>'
+                f' &middot; {rec["duration"]}s &middot; {rec["lines"]} lines</p>'
+            )
+
+        esc_text = text.replace("&", "&amp;").replace("<", "&lt;")
+        body = f"""
+        {meta}
+        <div class="session-nav">
+          <a href="/sessions/{sid-1}">&larr; session #{sid-1} (before)</a>
+          <a href="/sessions/{sid+1}">session #{sid+1} (after) &rarr;</a>
+        </div>
+        <pre class="term" style="height:70vh">{esc_text}</pre>
+        """
+        return render(f"Session #{sid}", "sessions", body)
+
+    # ------------------------------------------------------------------ #
+    # Settings page: extra columns + all of config.py's tunables
+    # ------------------------------------------------------------------ #
+    @app.route("/settings")
+    def settings_page():
+        extractors = fields.load(cfg)
+        fc_rows_json = json.dumps(extractors)
+
+        vals = settings.current_values(cfg)
+        sections = [
+            ("Serial link", ["SERIAL_PORT", "BAUD", "SERIAL_READ_TIMEOUT"]),
+            ("Detection & recovery", ["GOTOSLEEP_MARKER", "BOOT_BANNER_MARKER", "EXCEPTION_MARKERS",
+                                       "SOFT_RESET_DELAY", "BOOT_TIMEOUT", "STOP_SEND_DELAY"]),
+            ("Hardware reset (GPIO)", ["ENABLE_GPIO_RESET", "GPIO_RESET_PIN", "GPIO_RESET_PULSE"]),
+            ("Storage & UI", ["NORMAL_LOG_RETENTION", "LIVE_TAIL_LINES", "MONITORING_PAUSE_POLL_INTERVAL"]),
+        ]
+        spec_by_key = {k: (kind, label, help_) for k, kind, label, help_ in settings.FIELD_SPECS}
+
+        def render_field(key):
+            kind, label, help_ = spec_by_key[key]
+            value = vals[key]
+            if kind == "bool":
+                checked = "checked" if value else ""
+                return f"""
+                <label class="field-row checkbox">
+                  <input type="checkbox" name="{key}" {checked}>
+                  <span class="field-label">{esc(label)}</span>
+                </label>
+                <p class="field-help" style="margin:-0.7rem 0 1rem 1.6rem">{esc(help_)}</p>
+                """
+            if kind == "list":
+                text = "\n".join(value)
+                return f"""
+                <div class="field-row">
+                  <div class="field-label">{esc(label)}</div>
+                  <textarea name="{key}">{esc(text)}</textarea>
+                  <div class="field-help">{esc(help_)}</div>
+                </div>
+                """
+            input_type = "number" if kind in ("int", "float") else "text"
+            step = ' step="any"' if kind == "float" else ""
+            return f"""
+            <div class="field-row">
+              <div class="field-label">{esc(label)}</div>
+              <input type="{input_type}"{step} name="{key}" value="{esc(value)}">
+              <div class="field-help">{esc(help_)}</div>
+            </div>
+            """
+
+        sections_html = ""
+        for title, keys in sections:
+            fields_html = "".join(render_field(k) for k in keys)
+            sections_html += f"""
+            <div class="settings-section">
+              <div class="settings-section-label">{esc(title)}</div>
+              {fields_html}
+            </div>
+            """
+
+        readonly_rows = "".join(
+            f'<tr><td class="key">{esc(k)}</td><td>{esc(getattr(cfg, k, None))}</td><td class="hint">{esc(why)}</td></tr>'
+            for k, why in settings.NOT_EDITABLE
+        )
+
+        body = f"""
+        <h2 class="section-title">Session field extraction</h2>
+        <div class="panel fc">
           <table id="fcTable">
             <tr><th>Column</th><th>Regex (exactly one capture group)</th><th></th></tr>
           </table>
           <div class="controls" style="margin-top:0.6rem">
             <button class="btn" onclick="fcAddRow()">+ add column</button>
-            <button class="btn" onclick="fcSave()">Save</button>
+            <button class="btn" onclick="fcSave()">Save columns</button>
             <span id="fcMsg"></span>
           </div>
-          <div class="hint">Changes apply immediately to sessions already on disk, not just new ones --
-            these are read from the raw log at view time, not baked in when a session finishes.</div>
+          <div class="hint">These show up as extra columns on the Sessions page. Changes apply
+            immediately to sessions already on disk, not just new ones -- values are pulled from
+            each session's raw log at view time, not baked in when it finishes.</div>
+        </div>
+
+        <h2 class="section-title">Configuration</h2>
+        <form id="settingsForm">
+          {sections_html}
+          <button type="button" class="btn" onclick="saveSettings()">Save settings</button>
+          <span id="settingsMsg"></span>
+        </form>
+        <p class="hint" style="margin-top:0.6rem">Everything above takes effect immediately --
+          no restart needed. A few things aren't editable here at all (see below).</p>
+
+        <details class="panel" style="margin-top:1.25rem">
+          <summary>Not editable here ({len(settings.NOT_EDITABLE)})</summary>
+          <table class="readonly-table">
+            <tr><th>Setting</th><th>Current value</th><th>Why not</th></tr>
+            {readonly_rows}
+          </table>
         </details>
+
         <script>
         let fcExtractors = {fc_rows_json};
         function fcRender() {{
@@ -506,15 +645,38 @@ def create_app(monitor, cfg):
           if (data.errors && data.errors.length) {{
             msg.style.color = 'var(--red)'; msg.textContent = data.errors.join('; ');
           }} else {{
-            msg.style.color = 'var(--green)'; msg.textContent = 'saved -- reloading...';
-            setTimeout(() => location.reload(), 500);
+            msg.style.color = 'var(--green)'; msg.textContent = 'saved';
           }}
         }}
         fcRender();
+
+        async function saveSettings() {{
+          const form = document.getElementById('settingsForm');
+          const data = {{}};
+          form.querySelectorAll('input, textarea').forEach(el => {{
+            if (el.type === 'checkbox') {{
+              data[el.name] = el.checked;
+            }} else if (el.tagName === 'TEXTAREA') {{
+              data[el.name] = el.value.split('\\n');
+            }} else {{
+              data[el.name] = el.value;
+            }}
+          }});
+          const res = await fetch('/api/settings', {{
+            method:'POST', headers:{{'Content-Type':'application/json'}},
+            body: JSON.stringify(data)
+          }});
+          const result = await res.json();
+          const msg = document.getElementById('settingsMsg');
+          if (result.errors && result.errors.length) {{
+            msg.style.color = 'var(--red)'; msg.textContent = result.errors.join('; ');
+          }} else {{
+            msg.style.color = 'var(--green)'; msg.textContent = 'saved -- applied immediately, no restart needed';
+          }}
+        }}
         </script>
         """
-        active = "exceptions" if status == "EXCEPTION" else "sessions"
-        return render("Sessions", active, body)
+        return render("Settings", "settings", body)
 
     @app.route("/api/field-config", methods=["GET", "POST"])
     def api_field_config():
@@ -524,35 +686,14 @@ def create_app(monitor, cfg):
         errors = fields.save(cfg, payload.get("extractors", []))
         return jsonify({"ok": not errors, "errors": errors})
 
-    @app.route("/sessions/<int:sid>")
-    def session_detail(sid):
-        rec = monitor.find_record(sid)
-        text = monitor.read_session_text(sid)
-        if text is None:
-            body = f"<p>Session #{sid} has no log on disk"
-            body += " (pruned, it was a NORMAL session outside the retention window)." if rec else " -- unknown id."
-            body += '</p><p><a href="/sessions">&larr; back to sessions</a></p>'
-            return render(f"Session #{sid}", "sessions", body)
-
-        status = rec["status"] if rec else "?"
-        color = STATUS_COLORS.get(status, "#888")
-        meta = ""
-        if rec:
-            meta = (
-                f'<p class="meta"><b>#{rec["id"]}</b> &middot; '
-                f'<span class="badge" style="background:{color}22;color:{color}">{status}</span>'
-                f' &middot; {rec["duration"]}s &middot; {rec["lines"]} lines</p>'
-            )
-
-        esc_text = text.replace("&", "&amp;").replace("<", "&lt;")
-        body = f"""
-        {meta}
-        <div class="session-nav">
-          <a href="/sessions/{sid-1}">&larr; session #{sid-1} (before)</a>
-          <a href="/sessions/{sid+1}">session #{sid+1} (after) &rarr;</a>
-        </div>
-        <pre class="term" style="height:70vh">{esc_text}</pre>
-        """
-        return render(f"Session #{sid}", "sessions", body)
+    @app.route("/api/settings", methods=["GET", "POST"])
+    def api_settings():
+        if request.method == "GET":
+            return jsonify(settings.current_values(cfg))
+        payload = request.get_json(silent=True) or {}
+        errors = settings.save(cfg, payload)
+        if not errors:
+            monitor.resize_live_tail()
+        return jsonify({"ok": not errors, "errors": errors})
 
     return app

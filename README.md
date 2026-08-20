@@ -17,7 +17,8 @@ Zero W (v1), reachable over SSH and a small web dashboard. It also:
 - keeps every `EXCEPTION` / `ANOMALY` / `STOPPED` log forever, and prunes
   old `NORMAL` logs so the SD card doesn't fill up,
 - lets you pull extra columns (like `REFRESH` or `reset cause`) out of
-  each session's raw log with your own regexes, editable from the browser.
+  each session's raw log with your own regexes, and tune almost every
+  other setting too, all from a Settings page, live, no restart needed.
 
 Sessions are saved as `data/sessions/000123_STATUS.log`, numbered in order,
 so "the session before/after #123" is just `#122` / `#124` — the id *is*
@@ -79,7 +80,7 @@ exception-recovery path, never for the manual Stop/Resume buttons.
 sudo apt update
 sudo apt install -y python3-serial python3-flask git
 mkdir -p /home/pi/serial-guardian
-# copy config.py, monitor.py, webapp.py, fields.py, run.py, systemd/ here
+# copy config.py, monitor.py, webapp.py, fields.py, settings.py, run.py, systemd/ here
 #   e.g. scp -r ./pi-serial-guardian/* pi@guardian.local:~/serial-guardian/
 ```
 
@@ -188,11 +189,16 @@ next lever to pull is decoupling the web server from the serial reader
 (two processes instead of one, so a slow browser request can never delay
 a read) — not needed unless the above turns out to be insufficient.
 
-## Configurable columns on the Sessions page
+## Settings page
 
-Click **"Configure extra columns"** at the bottom of the Sessions page to
-add/edit/remove columns pulled out of each session's raw log with a regex,
-e.g. out of the box:
+Nav bar has **Live / Sessions / Settings** now (the old "Exceptions"
+shortcut is gone from the header — use the "Exception" filter pill on the
+Sessions page, or click the EXCEPTION count card on the Live page, either
+of which link to the same `/sessions?status=EXCEPTION` view).
+
+**Session field extraction** lives at the top of the Settings page —
+add/edit/remove columns pulled out of each session's raw log with a
+regex, shown on the Sessions page. Out of the box:
 
 | column | pulled from | pattern |
 |---|---|---|
@@ -206,10 +212,25 @@ rather than silently misbehaving. Config lives in
 `data/field_config.json`, not `config.py`, specifically so you can change
 it from the browser while mid-debug with no restart. It's also intentionally
 *not* baked into a session's record when the session finishes — values are
-pulled from the raw log at the moment you view the page, so adding a new
-column applies retroactively to sessions already sitting on disk, not just
-ones from that point forward. (Sessions whose raw log has since been
+pulled from the raw log at the moment you view the Sessions page, so adding
+a new column applies retroactively to sessions already sitting on disk, not
+just ones from that point forward. (Sessions whose raw log has since been
 pruned — see retention below — just show a blank for any column.)
+
+**Configuration** is the rest of the page: nearly every tunable in
+`config.py` — serial timing, the markers that decide NORMAL vs EXCEPTION,
+soft-reset/boot-timeout delays, GPIO settings, log retention, the live-tail
+buffer size — as a form, grouped the same way `config.py` is commented.
+Save applies changes **immediately, no restart needed**: it writes to
+`data/settings.json` and mutates the running process's config in place,
+which every part of the codebase already reads fresh at the point of use
+rather than caching at startup. A handful of things aren't exposed here —
+`DATA_DIR`, `WEB_HOST`/`WEB_PORT`, `SERVICE_NAME`, and the two raw
+control-byte sequences (`SOFT_RESET_BYTES`, `STOP_BYTES`) — each shown
+read-only at the bottom of the page with the specific reason (mostly:
+they're process-bootstrap values that can't retroactively rebind a
+listening socket or relocate a settings file that's already open). Edit
+`config.py` directly and restart the service for those.
 
 ## Actions toolbar (Live page)
 
@@ -276,14 +297,12 @@ add a single shared-password gate in front of the whole app.
 
 ## Tuning
 
-Everything in `config.py`:
-- add more `EXCEPTION_MARKERS` if your firmware grows new failure modes
-- `NORMAL_LOG_RETENTION` — how many normal-session logs to keep on disk
-  (index entries for pruned sessions stick around either way, just without
-  the raw text)
-- `SOFT_RESET_DELAY` / `BOOT_TIMEOUT` / `STOP_SEND_DELAY` if your board
-  needs more time to respond
-- `SERVICE_NAME` if you installed the systemd unit under a different name
+Nearly everything is now editable from the **Settings** page (see above)
+and takes effect immediately. `config.py` still holds the defaults, and is
+the only place for the handful of things the Settings page deliberately
+doesn't expose (`DATA_DIR`, `WEB_HOST`/`WEB_PORT`, `SERVICE_NAME`,
+`SOFT_RESET_BYTES`, `STOP_BYTES` — see the "Not editable here" section on
+the page itself for why each one).
 
 ## A note on scale
 
