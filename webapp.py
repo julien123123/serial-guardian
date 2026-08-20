@@ -6,10 +6,10 @@ dependencies) since this runs on a Pi Zero W and needs to work even with
 no internet access once it's set up.
 
 NOTE ON EXPOSURE: none of this has any authentication. Everything below
--- including "stop the whole service", "pause monitoring", "erase all
-sessions", and now the Settings page -- is reachable by anyone who can
-reach the Pi on your network. Fine on a trusted home LAN, worth knowing
-if that's not your situation.
+-- including "restart the service", "pause monitoring", "erase all
+sessions", and the Settings page -- is reachable by anyone who can reach
+the Pi on your network. Fine on a trusted home LAN, worth knowing if
+that's not your situation.
 """
 import json
 import subprocess
@@ -26,6 +26,26 @@ STATUS_COLORS = {
     "ANOMALY": "#e8b64b",
     "EXCEPTION": "#e55a5a",
     "STOPPED": "#5bc9c9",
+}
+
+# Small monochrome line-art icons for the toolbar, styled like the
+# engraved panel symbols on old tape/transport equipment -- stop/play/
+# pause read directly off a Nagra-style transport, reset and power use
+# the usual refresh/power glyphs. All use currentColor so CSS state
+# classes (.lit / .flashing / etc) can recolor them.
+ICONS = {
+    "stop": '<svg viewBox="0 0 20 20" fill="currentColor"><rect x="6" y="6" width="8" height="8"/></svg>',
+    "play": '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M7 5 L15 10 L7 15 Z"/></svg>',
+    "pause": '<svg viewBox="0 0 20 20" fill="currentColor"><rect x="6" y="5" width="3" height="10"/><rect x="11" y="5" width="3" height="10"/></svg>',
+    "reset": ('<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" '
+              'stroke-linecap="round" stroke-linejoin="round">'
+              '<path d="M15.5 7A6 6 0 1 1 14 4.2"/><path d="M11.5 3.3 L15.5 4.2 L14.6 8.2"/></svg>'),
+    "trash": ('<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" '
+              'stroke-linecap="round" stroke-linejoin="round">'
+              '<path d="M4 6h12"/><path d="M8 6V4h4v2"/><path d="M6 6l1 10h6l1-10"/>'
+              '<path d="M9 9v4M11 9v4"/></svg>'),
+    "power": ('<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" '
+              'stroke-linecap="round"><path d="M10 3v6"/><path d="M6 5.5a6 6 0 1 0 8 0"/></svg>'),
 }
 
 
@@ -93,8 +113,6 @@ BASE = """
   .dot.pause { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
 
   main { padding: 1.25rem; max-width: 1080px; margin: 0 auto; }
-
-  .topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; }
   .hint { color: var(--ink-dim); font-size: 0.8rem; }
 
   .stats { display: flex; gap: 0.75rem; margin-bottom: 1rem; flex-wrap: wrap; }
@@ -119,29 +137,64 @@ BASE = """
   button.btn:hover { border-color: var(--cyan); color: var(--cyan); }
   button.btn:disabled { opacity: 0.45; cursor: default; }
 
-  /* Right-aligned action toolbar: one-word label per group, short buttons,
-     full explanation lives in the title= tooltip rather than on the page. */
-  .toolbar { display: flex; gap: 0.9rem; flex-wrap: wrap; justify-content: flex-end; }
+  /* Console: the control strip is welded directly onto the monitor
+     window below it -- one bordered unit, like a control panel built
+     into the same chassis as the screen, rather than a toolbar floating
+     up near the navbar. */
+  .console { border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+             margin-bottom: 1rem; background: #0a0c0d; }
+  .console-strip {
+    display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+    padding: 0.7rem 0.9rem; flex-wrap: wrap;
+    background: linear-gradient(180deg, #1c2124, #14181a);
+    border-bottom: 1px solid var(--line);
+  }
+  .status-readout {
+    background: #0a0c0d; border: 1px solid var(--line); border-radius: 4px;
+    padding: 0.35rem 0.7rem; font-size: 0.85rem; line-height: 1.4;
+  }
+
+  .toolbar { display: flex; gap: 0.9rem; flex-wrap: wrap; }
   .tb-group {
-    display: flex; flex-direction: column; align-items: flex-start; gap: 0.3rem;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 0.35rem;
     padding-left: 0.9rem; border-left: 1px solid var(--line);
   }
   .tb-group:first-child { padding-left: 0; border-left: none; }
   .tb-label {
-    font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-dim);
+    font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.09em; color: var(--ink-dim);
   }
-  .tb-buttons { display: flex; gap: 0.35rem; }
-  .tb-btn {
-    font-family: var(--mono); font-size: 0.78rem; background: var(--panel); color: var(--ink);
-    border: 1px solid var(--line); border-radius: 5px; padding: 0.3rem 0.6rem; cursor: pointer;
+  .tb-buttons { display: flex; gap: 0.4rem; }
+
+  /* Icon "keys" -- brushed-metal chiclet buttons with an inset bevel,
+     the way a physical panel switch would be lit rather than labelled. */
+  .tb-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; padding: 0;
+    background: linear-gradient(180deg, #262c2f, #181d1f);
+    border: 1px solid #333b3e; border-radius: 4px;
+    color: var(--ink-dim); cursor: pointer;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 1px 2px rgba(0,0,0,0.5);
+    transition: color 0.15s, border-color 0.15s;
   }
-  .tb-btn:hover { border-color: var(--cyan); color: var(--cyan); }
-  .tb-btn.danger:hover { border-color: var(--red); color: var(--red); }
+  .tb-icon svg { width: 16px; height: 16px; display: block; }
+  .tb-icon:hover { color: var(--cyan); border-color: #3d474b; }
+  .tb-icon:active { box-shadow: inset 0 1px 3px rgba(0,0,0,0.6); transform: translateY(1px); }
+  .tb-icon.danger:hover { color: var(--red); }
+
+  .tb-icon.lit       { color: var(--green); filter: drop-shadow(0 0 3px var(--green)); }
+  .tb-icon.lit-cyan  { color: var(--cyan);  filter: drop-shadow(0 0 3px var(--cyan)); }
+  .tb-icon.lit-amber { color: var(--amber); filter: drop-shadow(0 0 3px var(--amber)); }
+
+  @keyframes lampFlicker {
+    0%, 49%   { color: var(--amber); filter: drop-shadow(0 0 4px var(--amber)); }
+    50%, 100% { color: var(--ink-dim); filter: none; }
+  }
+  .tb-icon.flashing { animation: lampFlicker 1s steps(1) infinite; }
 
   pre.term {
-    background: #0a0c0d; border: 1px solid var(--line); border-radius: 6px;
+    background: #0a0c0d; border: none; border-radius: 0; margin: 0;
     padding: 0.9rem 1rem; height: 55vh; overflow-y: auto;
-    white-space: pre-wrap; word-break: break-word; margin: 0;
+    white-space: pre-wrap; word-break: break-word;
   }
   pre.term .l-exc { border-left: 3px solid var(--red); padding-left: 0.5em; color: #f3a9a9; }
   pre.term .l-ok  { border-left: 3px solid var(--green); padding-left: 0.5em; }
@@ -231,66 +284,57 @@ def create_app(monitor, cfg):
             f'<div class="l">{k}</div></div></a>'
             for k, v in st["stats"].items()
         )
-        service_stop_title = (
-            "Stop the guardian service entirely. This page goes down too.\n"
-            f"Restart over SSH: sudo systemctl start {cfg.SERVICE_NAME}"
-        )
         exc_markers_json = json.dumps(cfg.EXCEPTION_MARKERS)
         body = f"""
-        <div class="topbar">
-          <div>
-            <p id="connLine" style="margin:0"></p>
-            <p id="subLine" class="hint" style="margin:0.25rem 0 0"></p>
-          </div>
-          <div class="toolbar">
-            <div class="tb-group">
-              <div class="tb-label">Device</div>
-              <div class="tb-buttons">
-                <button id="stopItem" class="tb-btn"
-                        title="Send Ctrl-C so the board halts at the REPL on its next update instead of sleeping"
-                        onclick="doStop()">Stop</button>
-                <button id="resumeItem" class="tb-btn" style="display:none"
-                        title="Send Ctrl-D to resume normal operation"
-                        onclick="doResume()">Resume</button>
-                <button class="tb-btn"
-                        title="Reboot the board now, whatever state it's in (halted, running, or asleep -- uses the hardware reset line if one is wired and it's not connected)"
-                        onclick="doResetDevice()">Reset</button>
-              </div>
-            </div>
-            <div class="tb-group">
-              <div class="tb-label">Monitoring</div>
-              <div class="tb-buttons">
-                <button id="pauseMonItem" class="tb-btn"
-                        title="Stop touching the serial port so mpremote or a terminal can use it. Nothing is logged while paused."
-                        onclick="doPauseMon()">Pause</button>
-                <button id="resumeMonItem" class="tb-btn" style="display:none"
-                        title="Reopen the serial port and resume monitoring"
-                        onclick="doResumeMon()">Resume</button>
-              </div>
-            </div>
-            <div class="tb-group">
-              <div class="tb-label">Service</div>
-              <div class="tb-buttons">
-                <button class="tb-btn"
-                        title="Restart the guardian service. Brief interruption, reconnects on its own."
-                        onclick="doService('restart')">Restart</button>
-                <button class="tb-btn danger" title="{service_stop_title}"
-                        onclick="doService('stop')">Stop</button>
-              </div>
-            </div>
-            <div class="tb-group">
-              <div class="tb-label">Data</div>
-              <div class="tb-buttons">
-                <button class="tb-btn danger"
-                        title="Permanently delete every session log and the index. Cannot be undone."
-                        onclick="doEraseSessions()">Erase</button>
-              </div>
-            </div>
-          </div>
-        </div>
-
         <div class="stats">{stats_html}</div>
-        <pre class="term" id="tail"></pre>
+
+        <div class="console">
+          <div class="console-strip">
+            <div class="status-readout">
+              <p id="connLine" style="margin:0"></p>
+              <p id="subLine" class="hint" style="margin:0.2rem 0 0"></p>
+            </div>
+            <div class="toolbar">
+              <div class="tb-group">
+                <div class="tb-label">Device</div>
+                <div class="tb-buttons">
+                  <button id="stopItem" class="tb-icon"
+                          title="Stop: halt the board at the REPL on its next update instead of sleeping"
+                          aria-label="Stop device" onclick="doStop()">{ICONS['stop']}</button>
+                  <button id="resumeItem" class="tb-icon" style="display:none"
+                          title="Resume normal operation" aria-label="Resume device"
+                          onclick="doResume()">{ICONS['play']}</button>
+                  <button id="resetItem" class="tb-icon"
+                          title="Reset: reboot the board now, whatever state it's in"
+                          aria-label="Reset device" onclick="doResetDevice()">{ICONS['reset']}</button>
+                </div>
+              </div>
+              <div class="tb-group">
+                <div class="tb-label">Monitoring</div>
+                <div class="tb-buttons">
+                  <button id="pauseMonItem" class="tb-icon"
+                          title="Pause monitoring: free the serial port for mpremote or a terminal"
+                          aria-label="Pause monitoring" onclick="doPauseMon()">{ICONS['pause']}</button>
+                  <button id="resumeMonItem" class="tb-icon" style="display:none"
+                          title="Resume monitoring" aria-label="Resume monitoring"
+                          onclick="doResumeMon()">{ICONS['play']}</button>
+                  <button class="tb-icon danger"
+                          title="Erase all session logs and the index (cannot be undone)"
+                          aria-label="Erase all sessions" onclick="doEraseSessions()">{ICONS['trash']}</button>
+                </div>
+              </div>
+              <div class="tb-group">
+                <div class="tb-label">Service</div>
+                <div class="tb-buttons">
+                  <button class="tb-icon"
+                          title="Restart the guardian service (brief interruption, reconnects on its own)"
+                          aria-label="Restart service" onclick="doRestartService()">{ICONS['power']}</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <pre class="term" id="tail"></pre>
+        </div>
         <script>
         const EXC_MARKERS = {exc_markers_json};
         function fmt(line) {{
@@ -322,30 +366,27 @@ def create_app(monitor, cfg):
             ' &nbsp;&middot;&nbsp; last session #' + s.last_session_id;
           document.getElementById('subLine').textContent = sub;
 
-          document.getElementById('stopItem').style.display = s.halted ? 'none' : 'inline-block';
-          document.getElementById('resumeItem').style.display = s.halted ? 'inline-block' : 'none';
-          document.getElementById('pauseMonItem').style.display = s.monitoring ? 'inline-block' : 'none';
-          document.getElementById('resumeMonItem').style.display = s.monitoring ? 'none' : 'inline-block';
+          document.getElementById('stopItem').style.display = s.halted ? 'none' : 'inline-flex';
+          document.getElementById('resumeItem').style.display = s.halted ? 'inline-flex' : 'none';
+          document.getElementById('pauseMonItem').style.display = s.monitoring ? 'inline-flex' : 'none';
+          document.getElementById('resumeMonItem').style.display = s.monitoring ? 'none' : 'inline-flex';
+
+          // Lamp states, like indicator lights on the panel rather than
+          // relying on text alone:
+          document.getElementById('stopItem').classList.toggle('flashing', !!s.stop_armed && !s.halted);
+          document.getElementById('resetItem').classList.toggle('lit', !!s.connected);
+          document.getElementById('resumeItem').classList.toggle('lit-cyan', !!s.halted);
+          document.getElementById('resumeMonItem').classList.toggle('lit-amber', !s.monitoring);
         }}
 
         async function doStop() {{ await fetch('/api/stop', {{method:'POST'}}); }}
         async function doResume() {{ await fetch('/api/resume', {{method:'POST'}}); }}
-        async function doResetDevice() {{
-          if (!confirm('Reset the device now?')) return;
-          await fetch('/api/device/reset', {{method:'POST'}});
-        }}
-        async function doPauseMon() {{
-          if (!confirm('Pause monitoring? This frees {cfg.SERIAL_PORT} for mpremote or another tool -- nothing will be logged until you resume.')) return;
-          await fetch('/api/monitoring/pause', {{method:'POST'}});
-        }}
+        async function doResetDevice() {{ await fetch('/api/device/reset', {{method:'POST'}}); }}
+        async function doPauseMon() {{ await fetch('/api/monitoring/pause', {{method:'POST'}}); }}
         async function doResumeMon() {{ await fetch('/api/monitoring/resume', {{method:'POST'}}); }}
-        async function doService(action) {{
-          const msgs = {{
-            restart: 'Restart the guardian service now? This briefly interrupts monitoring.',
-            stop: 'Stop the guardian service? This page goes unreachable until you SSH in and run:\\nsudo systemctl start {cfg.SERVICE_NAME}'
-          }};
-          if (!confirm(msgs[action])) return;
-          try {{ await fetch('/api/service/' + action, {{method:'POST'}}); }} catch (e) {{}}
+        async function doRestartService() {{
+          if (!confirm('Restart the guardian service now? This briefly interrupts monitoring.')) return;
+          try {{ await fetch('/api/service/restart', {{method:'POST'}}); }} catch (e) {{}}
         }}
         async function doEraseSessions() {{
           if (!confirm('Permanently erase ALL session logs and the index? This cannot be undone.')) return;
@@ -425,6 +466,10 @@ def create_app(monitor, cfg):
 
     @app.route("/api/service/stop", methods=["POST"])
     def api_service_stop():
+        # No button on the Live page for this anymore (pausing monitoring
+        # covers the mpremote use case without taking the whole tool
+        # down) -- left in place for scripting, e.g.
+        # curl -X POST http://guardian.local:8080/api/service/stop
         _delayed_systemctl("stop")
         return jsonify({"ok": True, "action": "stop"})
 

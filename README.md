@@ -232,20 +232,40 @@ they're process-bootstrap values that can't retroactively rebind a
 listening socket or relocate a settings file that's already open). Edit
 `config.py` directly and restart the service for those.
 
-## Actions toolbar (Live page)
+## The control panel (Live page)
 
-A short, right-aligned toolbar, grouped by what each part affects. Buttons
-are single words; hover any of them for the full explanation.
+The toolbar is fused directly onto the terminal view now — one bordered
+unit, control strip on top, the scrolling log immediately below it with no
+gap, rather than a row of buttons floating up near the navbar. Buttons are
+icons, grouped under one-word labels (Device / Monitoring / Service);
+hover any of them for the full explanation, since the label is gone from
+the button itself.
+
+The icon and state choices lean on old transport-deck conventions (Nagra
+reel-to-reel, the kind of gear in the background of *Blow Out*) rather
+than modern flat-UI icons — a filled square for Stop, a triangle for
+Resume, two bars for Pause, because that vocabulary already means exactly
+what it needs to mean without a caption. States show up as lamp behavior
+on the keys themselves instead of separate status text:
+
+- **Stop** (device) *flashes amber* while armed but not yet in effect —
+  you clicked it, but the board hasn't connected and actually halted yet.
+  Stops flashing the moment it does.
+- **Reset** (device) glows green **only while a serial session is
+  currently open** — it's a live indicator of whether there's a
+  connection for the soft-reset keystrokes to land on, not just a button
+  that's always available.
+- **Resume** (device) glows cyan, **Resume** (monitoring) glows amber,
+  matching the same colors as the connection-status dot next to the log —
+  so the lit key and the status line always agree with each other.
 
 **Device** — **Stop** halts the board at the REPL on its next update
 (Ctrl-C) so it stays awake instead of sleeping; **Resume** brings it back
-(Ctrl-D). **Reset** is new and unconditional: reboots the board right now
-regardless of whether it's halted, running normally, or asleep. If it's
-connected, that's the same soft-reset keystrokes used for automatic
-exception recovery (and the same escalation to the hardware line if it
-doesn't come back); if it's asleep and not connected at all, soft reset
-over serial isn't possible, so only the hardware line (if wired) can do
-anything.
+(Ctrl-D). **Reset** reboots the board right now regardless of whether it's
+halted, running normally, or asleep — if connected, the same soft-reset
+keystrokes used for automatic exception recovery (and the same escalation
+to the hardware line if it doesn't come back); if asleep and not connected
+at all, only the hardware line (if wired) can do anything.
 
 **Monitoring** — *this is the one you want for mpremote.* **Pause** tells
 Guardian to stop touching the serial port entirely: the next time its read
@@ -253,12 +273,16 @@ loop notices (within a fraction of a second), it closes `/dev/ttyACM0` and
 stops trying to reopen it, so `mpremote` (or a plain serial terminal) can
 grab it with nothing fighting over the port. Nothing gets logged while
 paused. **Resume** reopens the port and picks back up where it left off.
-Both stay within the same process — the web UI keeps working the whole
-time, unlike a full service stop.
+The **trash icon** next to them permanently deletes every session log and
+the index, restarting numbering at #1 — it lives here rather than in its
+own group since it's really a "reset the record, not the device" action.
+There's a confirm dialog because it can't be undone. (One honest caveat:
+if a session happens to finish at the exact instant you click it, that
+file can land back on disk right after — a rare, harmless race, not worth
+adding lock contention on the serial read path to fully close.)
 
-**Service** — the heavier hammer: `systemctl restart|stop
-serial-guardian`, via a narrowly scoped sudoers rule rather than broad
-sudo access:
+**Service** — just **Restart** now, via a narrowly scoped sudoers rule
+rather than broad sudo access:
 
 ```
 sudo visudo -cf systemd/serial-guardian.sudoers   # validate syntax first
@@ -266,31 +290,30 @@ sudo cp systemd/serial-guardian.sudoers /etc/sudoers.d/serial-guardian
 sudo chmod 440 /etc/sudoers.d/serial-guardian
 ```
 
-This grants the `pi` user passwordless rights to exactly those two
-commands, nothing broader. Without this file the buttons still appear but
-silently do nothing (`sudo -n` fails fast rather than hanging on a
-password prompt). **Restart** briefly interrupts monitoring, then systemd
-brings the service back per `Restart=always` — the page reconnects on its
-own. **Stop** takes the whole tool down (it's the same process serving
-this page), and being a deliberate `systemctl stop`, systemd will *not*
-auto-restart it. There's no "Start" button, deliberately: nothing could
-serve it once the process is down. Bring it back with:
-```
-ssh pi@guardian.local
-sudo systemctl start serial-guardian
-```
-In practice, **pausing monitoring is the right tool for using mpremote**
-— instant, reversible from the browser, doesn't take the dashboard down
-with it. Reach for full Stop only if Guardian itself needs bouncing.
+This grants the `pi` user passwordless rights to `systemctl restart
+serial-guardian`, nothing broader. Without this file the button still
+appears but silently does nothing (`sudo -n` fails fast rather than
+hanging on a password prompt). Briefly interrupts monitoring, then
+systemd brings it back per `Restart=always` — the page reconnects on its
+own. There's a confirm dialog on this one too.
 
-**Data** — **Erase** permanently deletes every session log and the index,
-and restarts numbering at #1. There's a confirm dialog because it can't be
-undone. (One honest caveat: if a session happens to finish at the exact
-instant you click Erase, its file can land back on disk right after —
-a rare, harmless race, not worth adding lock contention on the serial
-read path to fully close.)
+The full **Stop the whole service** button is gone — pausing monitoring
+covers the mpremote use case without taking the dashboard down with it,
+so the heavier action wasn't earning its place in the UI. The endpoint
+itself is still there if you ever want it from a script or `curl`:
+```
+curl -X POST http://guardian.local:8080/api/service/stop
+```
+(same sudoers rule, same "no restart on a deliberate stop" caveat as
+before — bring it back with `sudo systemctl start serial-guardian`
+over SSH.)
 
-**Worth knowing:** none of this — including Stop and Erase — has any
+Confirm dialogs now only show up on **Erase** and **Restart** — the two
+actions that are either irreversible or disruptive enough to warrant one.
+Everything else (Stop/Resume/Reset device, Pause/Resume monitoring) fires
+immediately on click, no "are you sure?" in the way.
+
+**Worth knowing:** none of this — including Erase and Restart — has any
 authentication. Anyone who can reach the Pi on your network can hit these.
 Fine on a trusted home LAN; if that's not your situation, say so and I can
 add a single shared-password gate in front of the whole app.
