@@ -18,7 +18,10 @@ Zero W (v1), reachable over SSH and a small web dashboard. It also:
   old `NORMAL` logs so the SD card doesn't fill up,
 - lets you pull extra columns (like `REFRESH` or `reset cause`) out of
   each session's raw log with your own regexes, and tune almost every
-  other setting too, all from a Settings page, live, no restart needed.
+  other setting too, all from a Settings page, live, no restart needed,
+- survives its own crashes and a hung web server without your intervention
+  (broad exception recovery, a disk-space guard, and a systemd watchdog
+  that checks both halves of the app independently).
 
 Sessions are saved as `data/sessions/000123_STATUS.log`, numbered in order,
 so "the session before/after #123" is just `#122` / `#124` — the id *is*
@@ -78,11 +81,18 @@ exception-recovery path, never for the manual Stop/Resume buttons.
 
 ```
 sudo apt update
-sudo apt install -y python3-serial python3-flask git
+sudo apt install -y python3-serial python3-flask python3-waitress git
 mkdir -p /home/pi/serial-guardian
-# copy config.py, monitor.py, webapp.py, fields.py, settings.py, run.py, systemd/ here
+# copy config.py, monitor.py, webapp.py, fields.py, settings.py, applog.py,
+# sdnotify.py, watchdog.py, run.py, systemd/ here
 #   e.g. scp -r ./pi-serial-guardian/* pi@guardian.local:~/serial-guardian/
 ```
+
+`python3-waitress` isn't strictly required — `run.py` falls back to Flask's
+own development server if it's missing — but it's a real production WSGI
+server built for exactly this (long-running, unattended), where Flask's is
+explicitly documented as not meant for that. See "If it stops responding"
+below for why this is worth the one extra apt package.
 
 Quick manual test:
 ```
@@ -102,8 +112,99 @@ sudo systemctl status serial-guardian
 ```
 It'll now survive reboots and restart itself if it ever crashes.
 
-To pick up a code update later: `scp` the changed file over, then
+To pick up a code update later: `scp` the changed file(s) over, then
 `sudo systemctl restart serial-guardian`.
+
+---
+
+## If it stops responding after running a while
+
+If logging just stops, the Live page stops updating, the toolbar stops
+responding, and even restarting the service doesn't bring it back — only
+a full `sudo reboot` does — you've hit a real, known issue, not something
+wrong with how you set this up. Two separate things can cause this, and
+this update adds defenses for both, plus ways to actually tell them apart
+next time.
+
+**What's now different:**
+
+- The monitor loop used to only catch `serial.SerialException` (a normal
+  disconnect). Anything else it hit — a disk error, a bug — would silently
+  kill the background thread with zero trace: no more logging, but the web
+  UI would look otherwise fine since only the monitor thread died. It now
+  catches *everything*, logs it with a full traceback to
+  `data/guardian.log`, and keeps going. If this was your whole problem,
+  it's fixed outright.
+- Flask's built-in development server (what `run.py` used exclusively
+  before) is explicitly documented as not meant to be left running for
+  extended periods — under `threaded=True` it spawns a new OS thread per
+  request, and on a resource-constrained Pi Zero W, sustained polling
+  (your browser hits `/api/tail` every 1.5s) over hours/days is exactly
+  the kind of long-running load it isn't built for. `run.py` now prefers
+  `waitress` (a real production WSGI server) automatically if it's
+  installed — see step 3 above.
+- The systemd unit now uses `Type=notify` with `WatchdogSec=60`, and a new
+  background thread (`watchdog.py`) pings systemd every ~15s *only* when
+  both the monitor loop's own heartbeat is recent **and** a real local
+  HTTP request to the Live page gets a response — so a hung Flask server
+  is caught independently of the monitor thread, and vice versa. If
+  either stops responding, systemd kills and restarts the process
+  automatically, without you needing to notice or click anything.
+- `_finish_session()` now checks free disk space before writing a
+  session's raw text (`MIN_FREE_DISK_MB` in Settings, default 100MB) and
+  skips the write with a logged warning instead of throwing if it's
+  critically low — a full SD card degrades gracefully now instead of
+  crash-looping.
+
+**What this can't fix on its own:** there's a well-documented issue where
+the Pi Zero/Pi 1's USB controller (`dwc_otg`) can lock up after repeated
+USB connect/disconnect cycles — which is exactly what this project does
+to your board every single wake/sleep cycle, dozens of times an hour.
+When it happens, `/dev/ttyACM0` stops appearing at all, and reports online
+say only a reboot recovers it (SSH and the rest of the system keep working
+fine in that case). If the fixes above don't fully solve it for you,
+this is the leading remaining suspect, and no amount of Python-level
+retry logic can fix a wedged kernel USB driver — but there are two things
+worth trying before a full reboot:
+
+```
+# find the USB bus:port for the board (look for "MicroPython" or
+# "idVendor=239a" — Adafruit's vendor ID — in the output)
+lsusb -v 2>/dev/null | grep -B5 -i micropython
+
+# then force the kernel to re-enumerate it without a full reboot
+# (replace 1-1 with whatever you found, e.g. from `dmesg | tail`)
+echo '1-1' | sudo tee /sys/bus/usb/drivers/usb/unbind
+sleep 1
+echo '1-1' | sudo tee /sys/bus/usb/drivers/usb/bind
+```
+
+Some people also report better long-term stability switching from the
+older `dwc_otg` driver to the newer `dwc2` one (`dtoverlay=dwc2` in
+`/boot/firmware/config.txt`, then reboot) — worth a search for your
+specific Pi model/OS version before changing it, since kernel parameter
+advice shifts between Raspberry Pi OS releases.
+
+**Next time it happens, before rebooting** — this preserves the evidence
+we'd need to actually pin down which of these it is:
+```
+ssh pi@guardian.local                              # does SSH even work?
+sudo systemctl status serial-guardian               # what state is it in?
+ps aux | grep run.py                                # check the STAT column --
+                                                      #   a 'D' means stuck in an
+                                                      #   uninterruptible kernel wait
+                                                      #   (confirms the USB-wedge theory)
+dmesg -T | tail -50                                  # look for usb/dwc_otg errors
+ls /dev/ttyACM*                                      # does the device node exist?
+curl http://127.0.0.1:8080/api/tail                  # run ON the Pi -- if this hangs
+                                                      #   too, it's not just WiFi/network
+sudo systemctl restart serial-guardian               # does a REAL restart (via SSH,
+                                                      #   not the dead UI button) work?
+tail -50 /home/pi/serial-guardian/data/guardian.log  # anything logged right before it broke?
+journalctl -u serial-guardian -n 100                 # systemd's own view of the same
+```
+If you hit this, I'd genuinely like to see that output — it's the
+difference between guessing and actually fixing the right thing.
 
 ---
 

@@ -4,7 +4,13 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+# If nothing pings the watchdog for this long, systemd kills and restarts
+# the process (Restart=always below still applies). Generous margin over
+# the ~15s health-check interval in watchdog.py so normal slow operations
+# (a soft-reset boot wait, a long GPS-sync session) never false-trigger it.
+WatchdogSec=60
 User=pi
 WorkingDirectory=/home/pi/serial-guardian
 ExecStart=/usr/bin/python3 /home/pi/serial-guardian/run.py

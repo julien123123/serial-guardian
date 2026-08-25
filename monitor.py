@@ -33,17 +33,33 @@ the kernel's USB CDC buffer fills up, and lines get dropped. The loop below
 blocks for the first byte (so it still sleeps properly when idle) and then
 drains everything else currently buffered in one read() call, which turns
 "one syscall per byte" into "about one syscall per burst".
+
+Reliability notes
+------------------
+run_forever() is wrapped so it can never die silently: any exception
+(not just the expected serial.SerialException from a normal disconnect)
+is logged with a full traceback and the loop just retries, rather than
+the whole monitor thread quietly evaporating. seconds_since_alive() feeds
+watchdog.py's health check, and _finish_session() checks free disk space
+before writing a session's raw text so a full SD card degrades (skips the
+raw log, keeps the index entry, logs a warning) instead of throwing.
+None of this can fix a genuine kernel/USB-level lockup on its own -- see
+the README's "if it stops responding" section for that.
 """
 
 import collections
 import glob
 import json
+import logging
 import os
+import shutil
 import subprocess
 import threading
 import time
 
 import serial
+
+logger = logging.getLogger("guardian")
 
 
 class SerialSessionMonitor:
@@ -63,6 +79,9 @@ class SerialSessionMonitor:
 
         # Cross-session state for pausing monitoring entirely (mpremote, etc).
         self._monitoring_on = True
+
+        # Watchdog heartbeat -- see seconds_since_alive() / watchdog.py.
+        self._last_alive = time.time()
 
         self._normal_files = collections.deque()  # rolling retention window
 
@@ -106,50 +125,78 @@ class SerialSessionMonitor:
     # main loop -- call this from a background thread
     # ------------------------------------------------------------------ #
     def run_forever(self):
-        cfg = self.cfg
+        """Never returns, and never dies quietly. _run_one_cycle() does the
+        real work; anything it raises -- not just the expected
+        serial.SerialException from a normal disconnect, but anything at
+        all (a disk error, a bug, whatever) -- is caught here, logged with
+        a full traceback, and the loop just tries again a second later."""
+        logger.info("monitor thread starting (port=%s)", self.cfg.SERIAL_PORT)
         while True:
-            if not self._monitoring_enabled():
-                # Paused: don't even try to open the port, so something
-                # else (mpremote, a terminal) can grab it freely.
+            self._last_alive = time.time()
+            try:
+                self._run_one_cycle()
+            except Exception:
+                logger.exception("monitor loop hit an unexpected error -- recovering")
                 with self.lock:
                     self.connected = False
                     self._ser = None
                     self._currently_halted = False
-                time.sleep(cfg.MONITORING_PAUSE_POLL_INTERVAL)
-                continue
+                try:
+                    self._finish_session()
+                except Exception:
+                    logger.exception("also failed to finish the in-flight session while recovering")
+                time.sleep(1.0)
 
-            try:
-                with serial.Serial(cfg.SERIAL_PORT, cfg.BAUD,
-                                    timeout=cfg.SERIAL_READ_TIMEOUT) as ser:
-                    with self.lock:
-                        self.connected = True
-                        self._ser = ser
-                    self._begin_session()
-                    self._arm_pending_stop_if_requested()
+    def seconds_since_alive(self):
+        """How long since the loop last ticked -- used by watchdog.py to
+        decide whether to keep telling systemd we're alive."""
+        return time.time() - self._last_alive
 
-                    buf = b""
-                    # Exits (closing the port via the `with` above) either
-                    # on a real disconnect (caught below) or because
-                    # monitoring got paused mid-session.
-                    while self._monitoring_enabled():
-                        n = ser.in_waiting
-                        chunk = ser.read(n if n else 1)   # blocks up to timeout when idle
-                        if chunk:
-                            buf += chunk
-                            while b"\n" in buf:
-                                raw, buf = buf.split(b"\n", 1)
-                                self._handle_line(ser, raw.decode(errors="ignore") + "\n")
-                        self._check_boot_timeout()
-                        self._check_pending_stop(ser)
-            except serial.SerialException:
-                pass  # board went to sleep / disconnected -- handled below either way
-
+    def _run_one_cycle(self):
+        cfg = self.cfg
+        if not self._monitoring_enabled():
+            # Paused: don't even try to open the port, so something
+            # else (mpremote, a terminal) can grab it freely.
             with self.lock:
                 self.connected = False
                 self._ser = None
-                self._currently_halted = False   # can't stay "halted" through a disconnect
-            self._finish_session()
-            time.sleep(0.2)
+                self._currently_halted = False
+            time.sleep(cfg.MONITORING_PAUSE_POLL_INTERVAL)
+            return
+
+        try:
+            with serial.Serial(cfg.SERIAL_PORT, cfg.BAUD,
+                                timeout=cfg.SERIAL_READ_TIMEOUT) as ser:
+                with self.lock:
+                    self.connected = True
+                    self._ser = ser
+                self._begin_session()
+                self._arm_pending_stop_if_requested()
+
+                buf = b""
+                # Exits (closing the port via the `with` above) either
+                # on a real disconnect (caught below) or because
+                # monitoring got paused mid-session.
+                while self._monitoring_enabled():
+                    self._last_alive = time.time()
+                    n = ser.in_waiting
+                    chunk = ser.read(n if n else 1)   # blocks up to timeout when idle
+                    if chunk:
+                        buf += chunk
+                        while b"\n" in buf:
+                            raw, buf = buf.split(b"\n", 1)
+                            self._handle_line(ser, raw.decode(errors="ignore") + "\n")
+                    self._check_boot_timeout()
+                    self._check_pending_stop(ser)
+        except serial.SerialException:
+            pass  # board went to sleep / disconnected -- handled below either way
+
+        with self.lock:
+            self.connected = False
+            self._ser = None
+            self._currently_halted = False   # can't stay "halted" through a disconnect
+        self._finish_session()
+        time.sleep(0.2)
 
     # ------------------------------------------------------------------ #
     # session lifecycle
@@ -215,8 +262,11 @@ class SerialSessionMonitor:
 
         fname = f"{sid:06d}_{status}.log"
         path = os.path.join(self.sessions_dir, fname)
-        with open(path, "w") as f:
-            f.write(text)
+        if self._has_disk_space():
+            with open(path, "w") as f:
+                f.write(text)
+        else:
+            logger.warning("low disk space -- skipped writing raw log for session #%d (%s)", sid, status)
 
         record = {
             "id": sid,
@@ -232,7 +282,20 @@ class SerialSessionMonitor:
         if status == "NORMAL" and self.cfg.NORMAL_LOG_RETENTION:
             self._prune_normal(path)
 
+        if status != "NORMAL":
+            logger.info("session #%d: %s (%.1fs, %d lines)", sid, status, duration, len(self._lines))
+
         self._reset_session_state()
+
+    def _has_disk_space(self):
+        """Guard against a full SD card turning a write failure into an
+        unhandled OSError -- checked before every raw session-log write,
+        not just once, since free space can change while running."""
+        try:
+            free_mb = shutil.disk_usage(self.cfg.DATA_DIR).free / (1024 * 1024)
+            return free_mb >= self.cfg.MIN_FREE_DISK_MB
+        except Exception:
+            return True  # if we can't even check, don't block writes over it
 
     def _prune_normal(self, path):
         self._normal_files.append(path)
@@ -285,6 +348,7 @@ class SerialSessionMonitor:
     def request_stop(self):
         """Arm a halt for the next time the board is connected. If it's
         connected right now, send it immediately too."""
+        logger.info("device stop requested")
         with self.lock:
             self._stop_armed = True
             ser, live = self._ser, self.connected
@@ -296,6 +360,7 @@ class SerialSessionMonitor:
         this is specifically the counterpart to request_stop() -- for an
         unconditional "reboot it now regardless of state", see
         reset_device() below)."""
+        logger.info("device resume requested")
         with self.lock:
             self._stop_armed = False
             ser, live, was_halted = self._ser, self.connected, self._currently_halted
@@ -316,6 +381,7 @@ class SerialSessionMonitor:
         connected at all (asleep, or not enumerating), soft reset over
         serial isn't possible -- the hardware line, if wired, is fired
         immediately instead since it doesn't need the USB link."""
+        logger.info("manual device reset requested")
         with self.lock:
             ser, live = self._ser, self.connected
         if live and ser is not None:
@@ -364,10 +430,12 @@ class SerialSessionMonitor:
         """Stop touching the serial port at all -- the run_forever loop
         notices within one read timeout and closes it, so an external
         tool can open it right after."""
+        logger.info("monitoring paused")
         with self.lock:
             self._monitoring_on = False
 
     def resume_monitoring(self):
+        logger.info("monitoring resumed")
         with self.lock:
             self._monitoring_on = True
 
@@ -449,6 +517,7 @@ class SerialSessionMonitor:
         session -- if one finishes at the exact moment this runs, it may
         land back on disk right after (a harmless, rare race; not worth
         adding lock contention on the serial read path to close it)."""
+        logger.warning("erasing all session history")
         for f in glob.glob(os.path.join(self.sessions_dir, "*.log")):
             try:
                 os.remove(f)

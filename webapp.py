@@ -569,7 +569,8 @@ def create_app(monitor, cfg):
             ("Detection & recovery", ["GOTOSLEEP_MARKER", "BOOT_BANNER_MARKER", "EXCEPTION_MARKERS",
                                        "SOFT_RESET_DELAY", "BOOT_TIMEOUT", "STOP_SEND_DELAY"]),
             ("Hardware reset (GPIO)", ["ENABLE_GPIO_RESET", "GPIO_RESET_PIN", "GPIO_RESET_PULSE"]),
-            ("Storage & UI", ["NORMAL_LOG_RETENTION", "LIVE_TAIL_LINES", "MONITORING_PAUSE_POLL_INTERVAL"]),
+            ("Storage & UI", ["NORMAL_LOG_RETENTION", "LIVE_TAIL_LINES",
+                               "MONITORING_PAUSE_POLL_INTERVAL", "MIN_FREE_DISK_MB"]),
         ]
         spec_by_key = {k: (kind, label, help_) for k, kind, label, help_ in settings.FIELD_SPECS}
 

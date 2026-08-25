@@ -46,6 +46,8 @@ FIELD_SPECS = [
      "How many lines the Live page's scrolling view keeps in memory."),
     ("MONITORING_PAUSE_POLL_INTERVAL", "float", "Pause poll interval (s)",
      "How often the paused monitor checks whether it's been resumed."),
+    ("MIN_FREE_DISK_MB", "int", "Minimum free disk (MB)",
+     "Below this, new sessions skip writing their raw log text (the index entry is still recorded) rather than risking a write failure."),
 ]
 
 # Shown on the Settings page as read-only, with the reason why.

@@ -74,6 +74,13 @@ MONITORING_PAUSE_POLL_INTERVAL = 0.3
 # over months of unattended running. Set to 0 to disable pruning entirely.
 NORMAL_LOG_RETENTION = 500
 
+# --- Disk safety ------------------------------------------------------
+# If free space on the DATA_DIR filesystem drops below this, a session's
+# raw log text is skipped (the index entry is still recorded) rather than
+# risking a write failure -- turns "SD card fills up" into a graceful
+# degradation instead of a crash loop.
+MIN_FREE_DISK_MB = 100
+
 # --- Web UI ------------------------------------------------------------
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8080
