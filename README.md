@@ -14,14 +14,14 @@ Zero W (v1), reachable over SSH and a small web dashboard. It also:
   `mpremote` or a terminal, without taking the web UI down,
 - lets you reset the device unconditionally, and erase all session
   history with one click,
-- keeps every `EXCEPTION` / `ANOMALY` / `STOPPED` log forever, and prunes
-  old `NORMAL` logs so the SD card doesn't fill up,
 - lets you pull extra columns (like `REFRESH` or `reset cause`) out of
   each session's raw log with your own regexes, and tune almost every
   other setting too, all from a Settings page, live, no restart needed,
 - survives its own crashes and a hung web server without your intervention
   (broad exception recovery, a disk-space guard, and a systemd watchdog
-  that checks both halves of the app independently).
+  that checks both halves of the app independently),
+- keeps every `EXCEPTION` / `ANOMALY` / `STOPPED` log forever, and prunes
+  old `NORMAL` logs so the SD card doesn't fill up.
 
 Sessions are saved as `data/sessions/000123_STATUS.log`, numbered in order,
 so "the session before/after #123" is just `#122` / `#124` — the id *is*
@@ -71,8 +71,8 @@ rare case where the board hangs *without* reaching the REPL:
 - Pi GPIO17 (physical pin 11) → 1kΩ resistor → board's **RESET** pin
 - Common ground (already shared via USB, but double-check)
 
-Then in `config.py` set `ENABLE_GPIO_RESET = True` and
-`sudo apt install -y python3-rpi.gpio`. The code drives the pin as an
+Then in the Settings page (or `config.py`) set `ENABLE_GPIO_RESET = True`
+and `sudo apt install -y python3-rpi.gpio`. The code drives the pin as an
 open-drain style pull (`OUT LOW` → `IN`/Hi-Z) so it never fights the
 board's own pull-up. This line is only ever used for the automatic
 exception-recovery path, never for the manual Stop/Resume buttons.
@@ -123,53 +123,44 @@ If logging just stops, the Live page stops updating, the toolbar stops
 responding, and even restarting the service doesn't bring it back — only
 a full `sudo reboot` does — you've hit a real, known issue, not something
 wrong with how you set this up. Two separate things can cause this, and
-this update adds defenses for both, plus ways to actually tell them apart
-next time.
+there are defenses in place for both, plus ways to actually tell them
+apart next time.
 
-**What's now different:**
+**What's in place:**
 
-- The monitor loop used to only catch `serial.SerialException` (a normal
-  disconnect). Anything else it hit — a disk error, a bug — would silently
-  kill the background thread with zero trace: no more logging, but the web
-  UI would look otherwise fine since only the monitor thread died. It now
-  catches *everything*, logs it with a full traceback to
-  `data/guardian.log`, and keeps going. If this was your whole problem,
-  it's fixed outright.
-- Flask's built-in development server (what `run.py` used exclusively
-  before) is explicitly documented as not meant to be left running for
-  extended periods — under `threaded=True` it spawns a new OS thread per
-  request, and on a resource-constrained Pi Zero W, sustained polling
-  (your browser hits `/api/tail` every 1.5s) over hours/days is exactly
-  the kind of long-running load it isn't built for. `run.py` now prefers
-  `waitress` (a real production WSGI server) automatically if it's
-  installed — see step 3 above.
-- The systemd unit now uses `Type=notify` with `WatchdogSec=60`, and a new
+- The monitor loop catches *every* exception (not just a normal
+  disconnect), logs it with a full traceback to `data/guardian.log`, and
+  keeps going instead of the background thread silently dying with zero
+  trace.
+- `run.py` prefers `waitress` (a real production WSGI server) automatically
+  if it's installed, since Flask's built-in development server is
+  explicitly documented as not meant to be left running for extended
+  periods — under sustained polling (your browser hits `/api/tail` every
+  1.5s) over hours/days on a resource-constrained Pi Zero W, that matters.
+- The systemd unit uses `Type=notify` with `WatchdogSec=60`, and a
   background thread (`watchdog.py`) pings systemd every ~15s *only* when
   both the monitor loop's own heartbeat is recent **and** a real local
   HTTP request to the Live page gets a response — so a hung Flask server
-  is caught independently of the monitor thread, and vice versa. If
-  either stops responding, systemd kills and restarts the process
-  automatically, without you needing to notice or click anything.
-- `_finish_session()` now checks free disk space before writing a
-  session's raw text (`MIN_FREE_DISK_MB` in Settings, default 100MB) and
-  skips the write with a logged warning instead of throwing if it's
-  critically low — a full SD card degrades gracefully now instead of
-  crash-looping.
+  is caught independently of the monitor thread, and vice versa. If either
+  stops responding, systemd kills and restarts the process automatically.
+- `_finish_session()` checks free disk space before writing a session's
+  raw text (`MIN_FREE_DISK_MB` in Settings, default 100MB) and skips the
+  write with a logged warning instead of throwing if it's critically low.
 
 **What this can't fix on its own:** there's a well-documented issue where
 the Pi Zero/Pi 1's USB controller (`dwc_otg`) can lock up after repeated
-USB connect/disconnect cycles — which is exactly what this project does
-to your board every single wake/sleep cycle, dozens of times an hour.
-When it happens, `/dev/ttyACM0` stops appearing at all, and reports online
-say only a reboot recovers it (SSH and the rest of the system keep working
-fine in that case). If the fixes above don't fully solve it for you,
-this is the leading remaining suspect, and no amount of Python-level
-retry logic can fix a wedged kernel USB driver — but there are two things
-worth trying before a full reboot:
+USB connect/disconnect cycles — which is exactly what this project does to
+your board every single wake/sleep cycle, dozens of times an hour. When it
+happens, `/dev/ttyACM0` stops appearing at all, and reports online say
+only a reboot recovers it (SSH and the rest of the system keep working
+fine in that case). If the fixes above don't fully solve it for you, this
+is the leading remaining suspect, and no amount of Python-level retry
+logic can fix a wedged kernel USB driver — but there are two things worth
+trying before a full reboot:
 
 ```
 # find the USB bus:port for the board (look for "MicroPython" or
-# "idVendor=239a" — Adafruit's vendor ID — in the output)
+# "idVendor=239a" -- Adafruit's vendor ID -- in the output)
 lsusb -v 2>/dev/null | grep -B5 -i micropython
 
 # then force the kernel to re-enumerate it without a full reboot
@@ -203,8 +194,6 @@ sudo systemctl restart serial-guardian               # does a REAL restart (via 
 tail -50 /home/pi/serial-guardian/data/guardian.log  # anything logged right before it broke?
 journalctl -u serial-guardian -n 100                 # systemd's own view of the same
 ```
-If you hit this, I'd genuinely like to see that output — it's the
-difference between guessing and actually fixing the right thing.
 
 ---
 
@@ -218,16 +207,20 @@ wake/sleep cycle of the board (same boundary your original script printed
   `"ep.__exit__ completed"` (the line `gotosleep()` prints right before the
   board powers its USB down cleanly).
 - **ANOMALY** — the session disconnected without that line, and without any
-  exception marker. In your sample log this also caught the button-press
-  GPS-sync session (66s, ends in `committed and resetting` instead of
-  `gotosleep()`) — a legitimate different code path, not a bug, but you
-  did ask to see anything that skips the normal shutdown, so it's flagged
-  for you to eyeball rather than silently assumed.
+  exception marker. In your original sample log this also caught the
+  button-press GPS-sync session (66s, ends in `committed and resetting`
+  instead of `gotosleep()`) — a legitimate different code path, not a bug,
+  but flagged for you to eyeball rather than silently assumed.
 - **EXCEPTION** — a traceback / `MemoryError` / exception-handler line
   showed up unprompted. This is the one that triggers an automatic reset.
-- **STOPPED** — you hit "Stop device on next update" in the web UI. The
-  board's own `Traceback` / `KeyboardInterrupt` from our Ctrl-C is expected
-  here and does **not** count as an EXCEPTION or trigger auto-recovery.
+- **STOPPED** — you hit "Stop" in the web UI. The board's own `Traceback` /
+  `KeyboardInterrupt` from our Ctrl-C is expected here and does **not**
+  count as an EXCEPTION or trigger auto-recovery.
+
+The big count cards on the Live page reflect **everything in `index.jsonl`**,
+restored from disk at startup — not just what's happened since the process
+last started. A restart doesn't zero out counts that reflect hundreds of
+already-recorded sessions; only Erase (see below) does that, deliberately.
 
 ## How the automatic reset works (EXCEPTION only)
 
@@ -243,122 +236,33 @@ wake/sleep cycle of the board (same boundary your original script printed
 3. If no boot banner shows up in time (board well and truly stuck) and
    you've wired the optional GPIO line, it pulses RESET.
 
-In your original pasted log, crashes were eventually cleared by what looks
-like a watchdog — but only after 173s and 472s of sitting idle at the REPL.
-With Guardian running, recovery happens in a couple of seconds instead.
-
-## Stop / Resume
-
-The **"Stop device on next update"** button on the Live page arms a halt:
-- if the board is connected right now, it sends Ctrl-C immediately;
-- if it's asleep, the request is remembered and applied the next time it
-  wakes and connects (no need to leave the browser tab open and wait).
-
-Ctrl-C interrupts whatever's running in `main.py` and drops MicroPython
-into the REPL, same as any other unhandled exception — except here it's
-expected, so it's tagged `STOPPED` rather than `EXCEPTION`, and the
-auto-reset logic leaves it alone. Because the board never reaches
-`gotosleep()`, it stays awake and connected (and drawing power) until you
-either hit **Resume** (sends Ctrl-D, same soft-reboot as the auto-recovery
-path) or reset it some other way.
-
-One caveat, since I don't have your firmware source: this assumes
-`main.py` doesn't catch `KeyboardInterrupt` internally and just carry on.
-If your loop is wrapped in a broad `except:` that swallows it, Ctrl-C won't
-actually stop anything — worth testing once on a session you don't mind
-losing, and if that's the case, let me know how `main.py` structures its
-top-level loop and I can adjust the approach.
-
-## Why lines used to go missing on the Pi but not your laptop
-
-pyserial's `Serial.readline()` reads **one byte per syscall** (the default
-`io.RawIOBase` behaviour) — fine on a fast, multi-core laptop, but a
-single-core Pi Zero W can't always keep up with bursty output: a traceback
-printing fast, or the ~50 GPS NMEA lines your log shows arriving in under a
-second. Python falls behind, the kernel's USB-serial buffer fills up, and
-bytes get silently dropped while the CPU is busy elsewhere (which is more
-likely to happen during exactly the bursty, "anormal" sessions you noticed
-this in).
-
-The read loop now blocks for the first byte (so it still sleeps properly
-between updates) and then drains **everything else currently buffered** in
-a single `read()` call, turning "one syscall per byte" into "about one
-syscall per burst." I tested this against a simulated 600-line burst
-delivered all at once and confirmed every line makes it into the log —
-but if you still see gaps on real hardware at very high line rates, the
-next lever to pull is decoupling the web server from the serial reader
-(two processes instead of one, so a slow browser request can never delay
-a read) — not needed unless the above turns out to be insufficient.
-
-## Settings page
-
-Nav bar has **Live / Sessions / Settings** now (the old "Exceptions"
-shortcut is gone from the header — use the "Exception" filter pill on the
-Sessions page, or click the EXCEPTION count card on the Live page, either
-of which link to the same `/sessions?status=EXCEPTION` view).
-
-**Session field extraction** lives at the top of the Settings page —
-add/edit/remove columns pulled out of each session's raw log with a
-regex, shown on the Sessions page. Out of the box:
-
-| column | pulled from | pattern |
-|---|---|---|
-| `REFRESH` | `REFRESH: 8` (the SESSION dump block) | `REFRESH:\s*(\d+)` |
-| `reset_cause` | `State: reset cause = 16, wake up pins [39]` | `reset cause = (\d+)` |
-| `wake_pins` | same line | `wake up pins \[([^\]]*)\]` |
-
-Each pattern needs **exactly one capture group** — that's the value shown
-in the column; the save button rejects anything else with an explanation
-rather than silently misbehaving. Config lives in
-`data/field_config.json`, not `config.py`, specifically so you can change
-it from the browser while mid-debug with no restart. It's also intentionally
-*not* baked into a session's record when the session finishes — values are
-pulled from the raw log at the moment you view the Sessions page, so adding
-a new column applies retroactively to sessions already sitting on disk, not
-just ones from that point forward. (Sessions whose raw log has since been
-pruned — see retention below — just show a blank for any column.)
-
-**Configuration** is the rest of the page: nearly every tunable in
-`config.py` — serial timing, the markers that decide NORMAL vs EXCEPTION,
-soft-reset/boot-timeout delays, GPIO settings, log retention, the live-tail
-buffer size — as a form, grouped the same way `config.py` is commented.
-Save applies changes **immediately, no restart needed**: it writes to
-`data/settings.json` and mutates the running process's config in place,
-which every part of the codebase already reads fresh at the point of use
-rather than caching at startup. A handful of things aren't exposed here —
-`DATA_DIR`, `WEB_HOST`/`WEB_PORT`, `SERVICE_NAME`, and the two raw
-control-byte sequences (`SOFT_RESET_BYTES`, `STOP_BYTES`) — each shown
-read-only at the bottom of the page with the specific reason (mostly:
-they're process-bootstrap values that can't retroactively rebind a
-listening socket or relocate a settings file that's already open). Edit
-`config.py` directly and restart the service for those.
-
 ## The control panel (Live page)
 
-The toolbar is fused directly onto the terminal view now — one bordered
-unit, control strip on top, the scrolling log immediately below it with no
-gap, rather than a row of buttons floating up near the navbar. Buttons are
-icons, grouped under one-word labels (Device / Monitoring / Service);
-hover any of them for the full explanation, since the label is gone from
-the button itself.
+Status is a single line — a colored lamp (bigger now, more like a panel
+indicator than a UI dot) plus a short label and the last session number.
+It never grows a second line: anything extra (why it's armed, what a
+pending action is waiting on) lives in that line's hover tooltip instead,
+so the console strip's height never jumps around between states.
+
+The toolbar is fused directly onto the terminal view — one bordered unit,
+control strip on top, the scrolling log immediately below it with no gap.
+Buttons are icons, grouped under one-word labels (Device / Monitoring /
+Service); hover any of them for the full explanation.
 
 The icon and state choices lean on old transport-deck conventions (Nagra
-reel-to-reel, the kind of gear in the background of *Blow Out*) rather
-than modern flat-UI icons — a filled square for Stop, a triangle for
-Resume, two bars for Pause, because that vocabulary already means exactly
-what it needs to mean without a caption. States show up as lamp behavior
-on the keys themselves instead of separate status text:
+reel-to-reel, the kind of gear in the background of *Blow Out*) — a filled
+square for Stop, a triangle for Resume, two bars for Pause. States show up
+as lamp behavior on the keys themselves:
 
 - **Stop** (device) *flashes amber* while armed but not yet in effect —
-  you clicked it, but the board hasn't connected and actually halted yet.
-  Stops flashing the moment it does.
+  stops the moment it actually halts.
 - **Reset** (device) glows green **only while a serial session is
-  currently open** — it's a live indicator of whether there's a
-  connection for the soft-reset keystrokes to land on, not just a button
-  that's always available.
+  currently open** — a live indicator of whether there's a connection for
+  the soft-reset keystrokes to land on.
 - **Resume** (device) glows cyan, **Resume** (monitoring) glows amber,
-  matching the same colors as the connection-status dot next to the log —
-  so the lit key and the status line always agree with each other.
+  matching the connection-status lamp's own colors for those states.
+- **Pause** (monitoring) also flashes amber while a pause is *queued*
+  behind a pending Stop — see below.
 
 **Device** — **Stop** halts the board at the REPL on its next update
 (Ctrl-C) so it stays awake instead of sleeping; **Resume** brings it back
@@ -369,21 +273,28 @@ to the hardware line if it doesn't come back); if asleep and not connected
 at all, only the hardware line (if wired) can do anything.
 
 **Monitoring** — *this is the one you want for mpremote.* **Pause** tells
-Guardian to stop touching the serial port entirely: the next time its read
-loop notices (within a fraction of a second), it closes `/dev/ttyACM0` and
-stops trying to reopen it, so `mpremote` (or a plain serial terminal) can
-grab it with nothing fighting over the port. Nothing gets logged while
-paused. **Resume** reopens the port and picks back up where it left off.
-The **trash icon** next to them permanently deletes every session log and
-the index, restarting numbering at #1 — it lives here rather than in its
-own group since it's really a "reset the record, not the device" action.
-There's a confirm dialog because it can't be undone. (One honest caveat:
-if a session happens to finish at the exact instant you click it, that
-file can land back on disk right after — a rare, harmless race, not worth
-adding lock contention on the serial read path to fully close.)
+Guardian to stop touching the serial port entirely, so `mpremote` (or a
+plain serial terminal) can grab it with nothing fighting over the port.
+Nothing gets logged while paused. **Resume** reopens the port.
 
-**Service** — just **Restart** now, via a narrowly scoped sudoers rule
-rather than broad sudo access:
+If you press **Stop** and then, before it's actually taken effect, press
+**Pause** — e.g. Stop is merely *armed*, waiting for the board to next wake
+and connect — Guardian defers the pause rather than closing the port out
+from under the pending stop. An armed-but-undelivered stop needs a live
+connection to ever get sent; closing the port first would strand it
+indefinitely. The Pause key flashes amber while queued this way, and the
+pause applies automatically the instant the stop actually completes. If
+you cancel the pending stop instead (Resume or Reset before it fires), the
+queued pause is dropped too rather than silently firing later on its own.
+
+The **trash icon** next to Pause/Resume permanently deletes every session
+log and the index, restarting numbering — and resetting the count cards —
+back to zero. It lives here rather than in its own group since it's really
+a "reset the record, not the device" action. Confirm dialog, since it
+can't be undone.
+
+**Service** — just **Restart**, via a narrowly scoped sudoers rule rather
+than broad sudo access:
 
 ```
 sudo visudo -cf systemd/serial-guardian.sudoers   # validate syntax first
@@ -391,48 +302,70 @@ sudo cp systemd/serial-guardian.sudoers /etc/sudoers.d/serial-guardian
 sudo chmod 440 /etc/sudoers.d/serial-guardian
 ```
 
-This grants the `pi` user passwordless rights to `systemctl restart
+Grants the `pi` user passwordless rights to `systemctl restart
 serial-guardian`, nothing broader. Without this file the button still
-appears but silently does nothing (`sudo -n` fails fast rather than
-hanging on a password prompt). Briefly interrupts monitoring, then
-systemd brings it back per `Restart=always` — the page reconnects on its
-own. There's a confirm dialog on this one too.
+appears but silently does nothing. Confirm dialog on this one too.
 
-The full **Stop the whole service** button is gone — pausing monitoring
-covers the mpremote use case without taking the dashboard down with it,
-so the heavier action wasn't earning its place in the UI. The endpoint
-itself is still there if you ever want it from a script or `curl`:
+The full **Stop the whole service** button is gone from the UI — pausing
+monitoring covers the mpremote use case without taking the dashboard down
+with it. The endpoint itself is still there for scripting:
 ```
 curl -X POST http://guardian.local:8080/api/service/stop
 ```
-(same sudoers rule, same "no restart on a deliberate stop" caveat as
-before — bring it back with `sudo systemctl start serial-guardian`
-over SSH.)
+(same sudoers rule, same "no restart on a deliberate stop" caveat — bring
+it back with `sudo systemctl start serial-guardian` over SSH.)
 
-Confirm dialogs now only show up on **Erase** and **Restart** — the two
+Confirm dialogs only show up on **Erase** and **Restart** — the two
 actions that are either irreversible or disruptive enough to warrant one.
-Everything else (Stop/Resume/Reset device, Pause/Resume monitoring) fires
-immediately on click, no "are you sure?" in the way.
+Everything else fires immediately on click.
 
 **Worth knowing:** none of this — including Erase and Restart — has any
 authentication. Anyone who can reach the Pi on your network can hit these.
 Fine on a trusted home LAN; if that's not your situation, say so and I can
 add a single shared-password gate in front of the whole app.
 
+## Settings page
+
+**Session field extraction** — add/edit/remove columns pulled out of each
+session's raw log with a regex, shown on the Sessions page. Out of the box:
+
+| column | pulled from | pattern |
+|---|---|---|
+| `REFRESH` | `REFRESH: 8` (the SESSION dump block) | `REFRESH:\s*(\d+)` |
+| `reset_cause` | `State: reset cause = 16, wake up pins [39]` | `reset cause = (\d+)` |
+| `wake_pins` | same line | `wake up pins \[([^\]]*)\]` |
+
+Each pattern needs **exactly one capture group**. Config lives in
+`data/field_config.json`, not `config.py`, so you can change it from the
+browser mid-debug with no restart. It's evaluated at *view* time against
+each session's raw log, not baked in when the session finishes — so a new
+column applies retroactively to sessions already on disk.
+
+**Configuration** is nearly every tunable in `config.py` — serial timing,
+detection markers, reset delays, GPIO settings, log retention, the
+live-tail buffer, `MIN_FREE_DISK_MB` — as a form. Saves apply immediately,
+no restart: writes to `data/settings.json` and mutates the running
+process's config in place, which everything already reads fresh at the
+point of use. A handful of things aren't exposed — `DATA_DIR`,
+`WEB_HOST`/`WEB_PORT`, `SERVICE_NAME`, `SOFT_RESET_BYTES`, `STOP_BYTES` —
+each shown read-only with the specific reason (mostly: process-bootstrap
+values that can't retroactively rebind a socket or relocate an open file).
+
 ## Tuning
 
-Nearly everything is now editable from the **Settings** page (see above)
-and takes effect immediately. `config.py` still holds the defaults, and is
-the only place for the handful of things the Settings page deliberately
-doesn't expose (`DATA_DIR`, `WEB_HOST`/`WEB_PORT`, `SERVICE_NAME`,
-`SOFT_RESET_BYTES`, `STOP_BYTES` — see the "Not editable here" section on
-the page itself for why each one).
+Nearly everything is editable from the **Settings** page and takes effect
+immediately. `config.py` still holds the defaults, and is the only place
+for the handful of things Settings deliberately doesn't expose.
 
 ## A note on scale
 
 `recent_sessions()` and `find_record()` shell out to `tail`/`grep` on
-`index.jsonl` rather than loading the whole file into memory, so this
-stays comfortable on a Zero W's 512MB even after months of logging. If you
+`index.jsonl` rather than loading the whole file into memory, so browsing
+sessions stays comfortable on a Zero W's 512MB even after months of
+logging. The cumulative stats on the Live page (`self.stats`) *are* built
+by reading the whole file once, at startup only — a one-time cost, not a
+per-request one, and still fast even at tens of thousands of lines. If you
 ever want proper querying (e.g. "all EXCEPTIONs in the last 30 days"),
 swapping `index.jsonl` for a small SQLite table is the natural next step —
-not done here to keep the dependency list to `pyserial` + `Flask`.
+not done here to keep the dependency list to `pyserial` + `Flask`
+(+ `waitress`).

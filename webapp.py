@@ -106,11 +106,17 @@ BASE = """
   nav a { color: var(--ink-dim); }
   nav a.active { color: var(--ink); border-bottom: 2px solid var(--green); }
 
-  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 0.4em; }
-  .dot.up { background: var(--green); box-shadow: 0 0 6px var(--green); }
-  .dot.down { background: var(--red); box-shadow: 0 0 6px var(--red); }
-  .dot.halt { background: var(--cyan); box-shadow: 0 0 6px var(--cyan); }
-  .dot.pause { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+  /* Bigger, more lamp-like status indicator -- a proper panel light
+     rather than a small UI dot. vertical-align: middle keeps it centered
+     against the label text at this larger size. */
+  .dot {
+    width: 14px; height: 14px; border-radius: 50%; display: inline-block;
+    margin-right: 0.5em; vertical-align: middle;
+  }
+  .dot.up { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot.down { background: var(--red); box-shadow: 0 0 8px var(--red); }
+  .dot.halt { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+  .dot.pause { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
 
   main { padding: 1.25rem; max-width: 1080px; margin: 0 auto; }
   .hint { color: var(--ink-dim); font-size: 0.8rem; }
@@ -149,9 +155,12 @@ BASE = """
     background: linear-gradient(180deg, #1c2124, #14181a);
     border-bottom: 1px solid var(--line);
   }
+  /* Single-line status readout -- deliberately never grows a second line
+     (extra context lives in this element's title= tooltip instead), so
+     the console strip's height never jumps around between states. */
   .status-readout {
     background: #0a0c0d; border: 1px solid var(--line); border-radius: 4px;
-    padding: 0.35rem 0.7rem; font-size: 0.85rem; line-height: 1.4;
+    padding: 0.45rem 0.8rem; font-size: 0.85rem; line-height: 1.4;
   }
 
   .toolbar { display: flex; gap: 0.9rem; flex-wrap: wrap; }
@@ -290,9 +299,8 @@ def create_app(monitor, cfg):
 
         <div class="console">
           <div class="console-strip">
-            <div class="status-readout">
+            <div class="status-readout" id="statusReadout">
               <p id="connLine" style="margin:0"></p>
-              <p id="subLine" class="hint" style="margin:0.2rem 0 0"></p>
             </div>
             <div class="toolbar">
               <div class="tb-group">
@@ -313,7 +321,7 @@ def create_app(monitor, cfg):
                 <div class="tb-label">Monitoring</div>
                 <div class="tb-buttons">
                   <button id="pauseMonItem" class="tb-icon"
-                          title="Pause monitoring: free the serial port for mpremote or a terminal"
+                          title="Pause monitoring: free the serial port for mpremote or a terminal. If a device stop is pending, waits for it to complete first."
                           aria-label="Pause monitoring" onclick="doPauseMon()">{ICONS['pause']}</button>
                   <button id="resumeMonItem" class="tb-icon" style="display:none"
                           title="Resume monitoring" aria-label="Resume monitoring"
@@ -361,10 +369,19 @@ def create_app(monitor, cfg):
             dot = 'down'; label = 'disconnected';
             if (s.stop_armed) sub = 'armed -- will halt the next time it wakes';
           }}
+          if (s.pause_pending) {{
+            sub = (sub ? sub + ' -- ' : '') + 'pause queued, waiting for the stop to complete';
+          }}
+
           document.getElementById('connLine').innerHTML =
             '<span class="dot ' + dot + '"></span>' + label +
             ' &nbsp;&middot;&nbsp; last session #' + s.last_session_id;
-          document.getElementById('subLine').textContent = sub;
+
+          // Single line, always -- extra context lives in the hover
+          // tooltip instead of a second line, so the console strip's
+          // height never jumps around between states.
+          const readout = document.getElementById('statusReadout');
+          if (sub) {{ readout.title = sub; }} else {{ readout.removeAttribute('title'); }}
 
           document.getElementById('stopItem').style.display = s.halted ? 'none' : 'inline-flex';
           document.getElementById('resumeItem').style.display = s.halted ? 'inline-flex' : 'none';
@@ -377,6 +394,8 @@ def create_app(monitor, cfg):
           document.getElementById('resetItem').classList.toggle('lit', !!s.connected);
           document.getElementById('resumeItem').classList.toggle('lit-cyan', !!s.halted);
           document.getElementById('resumeMonItem').classList.toggle('lit-amber', !s.monitoring);
+          // Pause flashes too while it's queued behind an armed-not-yet-halted stop.
+          document.getElementById('pauseMonItem').classList.toggle('flashing', !!s.pause_pending);
         }}
 
         async function doStop() {{ await fetch('/api/stop', {{method:'POST'}}); }}

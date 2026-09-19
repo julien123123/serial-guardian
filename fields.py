@@ -16,7 +16,7 @@ point of making this runtime-configurable.
 
 Config lives in DATA_DIR/field_config.json so it survives service
 restarts but needs no code deploy to change; edit it from the web UI
-(Sessions page) or by hand.
+(Settings page) or by hand.
 """
 import json
 import os

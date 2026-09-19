@@ -2,7 +2,9 @@
 Serial Guardian configuration.
 
 Edit these to match your hardware. Nothing in here needs to change unless
-noted otherwise.
+noted otherwise. Nearly everything below is also editable live from the
+Settings page (see settings.py) -- these are just the defaults / what a
+fresh install starts with.
 """
 
 # --- Serial link to the MicroPython board -----------------------------------
@@ -63,10 +65,6 @@ GPIO_RESET_PULSE = 0.25        # seconds to hold RESET low
 STOP_BYTES = b"\x03\x03"
 STOP_SEND_DELAY = 0.4          # settle time after a fresh connect before sending it
 
-# --- Pause monitoring outright (e.g. to hand the port to mpremote) ---------
-# How often the paused run_forever loop checks whether it's been resumed.
-MONITORING_PAUSE_POLL_INTERVAL = 0.3
-
 # --- Disk usage ------------------------------------------------------------
 # Full raw logs are always kept for EXCEPTION, ANOMALY and STOPPED sessions
 # (rare, and exactly what you want to go back and read). Plain NORMAL
@@ -80,6 +78,10 @@ NORMAL_LOG_RETENTION = 500
 # risking a write failure -- turns "SD card fills up" into a graceful
 # degradation instead of a crash loop.
 MIN_FREE_DISK_MB = 100
+
+# --- Pause monitoring outright (e.g. to hand the port to mpremote) ---------
+# How often the paused run_forever loop checks whether it's been resumed.
+MONITORING_PAUSE_POLL_INTERVAL = 0.3
 
 # --- Web UI ------------------------------------------------------------
 WEB_HOST = "0.0.0.0"

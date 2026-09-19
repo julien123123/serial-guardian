@@ -16,12 +16,18 @@ but treats each connect/disconnect cycle as a "session" and:
     "reset now" that works regardless of current state
   * lets the web UI pause/resume monitoring outright -- closing the serial
     port entirely so an external tool (mpremote, a terminal, whatever) can
-    have it, without needing to touch the systemd service at all
+    have it, without needing to touch the systemd service at all. If a
+    device stop is armed-but-not-yet-in-effect when pause is requested,
+    the pause is deferred until the stop actually completes, so an armed
+    stop can never get stranded behind a port that's already closed.
   * lets the web UI erase all session history and start numbering over
 
 Session files are numbered sequentially (000123_NORMAL.log, ...), so
 "the session before/after" a flagged one is just id-1 / id+1 -- no need to
-duplicate content, the id is the pointer.
+duplicate content, the id is the pointer. Cumulative counts (self.stats)
+are restored from index.jsonl on startup, not just zeroed and rebuilt from
+scratch -- a restart shouldn't make hundreds of already-recorded sessions
+disappear from the Live page's counters.
 
 Read loop notes
 ----------------
@@ -69,7 +75,6 @@ class SerialSessionMonitor:
 
         self.connected = False
         self.live_tail = collections.deque(maxlen=cfg.LIVE_TAIL_LINES)
-        self.stats = {"NORMAL": 0, "ANOMALY": 0, "EXCEPTION": 0, "STOPPED": 0}
         self.last_session_id = 0
 
         # Cross-session state for the manual stop/resume feature.
@@ -79,6 +84,7 @@ class SerialSessionMonitor:
 
         # Cross-session state for pausing monitoring entirely (mpremote, etc).
         self._monitoring_on = True
+        self._pause_pending = False    # a pause is queued behind an armed-but-not-yet-halted stop
 
         # Watchdog heartbeat -- see seconds_since_alive() / watchdog.py.
         self._last_alive = time.time()
@@ -89,23 +95,43 @@ class SerialSessionMonitor:
         self.index_path = os.path.join(cfg.DATA_DIR, "index.jsonl")
         os.makedirs(self.sessions_dir, exist_ok=True)
 
-        self._load_next_id_from_disk()
+        self._load_state_from_disk()
         self._reset_session_state()
 
     # ------------------------------------------------------------------ #
     # startup helpers
     # ------------------------------------------------------------------ #
-    def _load_next_id_from_disk(self):
-        """Pick up numbering where a previous run left off."""
+    def _load_state_from_disk(self):
+        """Restore numbering AND cumulative stats from a previous run's
+        index.jsonl, so a restart doesn't zero out counts that reflect
+        sessions already recorded -- read the whole file once, at
+        startup only (not on any per-request path)."""
         self.next_id = 1
-        if os.path.exists(self.index_path):
-            last_line = None
-            with open(self.index_path, "r") as f:
-                for line in f:
-                    if line.strip():
-                        last_line = line
-            if last_line:
+        self.stats = {"NORMAL": 0, "ANOMALY": 0, "EXCEPTION": 0, "STOPPED": 0}
+        if not os.path.exists(self.index_path):
+            self.last_session_id = 0
+            return
+
+        last_line = None
+        with open(self.index_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                last_line = line
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                status = rec.get("status")
+                if status in self.stats:
+                    self.stats[status] += 1
+
+        if last_line:
+            try:
                 self.next_id = json.loads(last_line)["id"] + 1
+            except (json.JSONDecodeError, KeyError):
+                pass
         self.last_session_id = self.next_id - 1
 
     def _reset_session_state(self):
@@ -362,9 +388,13 @@ class SerialSessionMonitor:
         reset_device() below)."""
         logger.info("device resume requested")
         with self.lock:
+            was_armed_not_halted = self._stop_armed and not self._currently_halted
             self._stop_armed = False
             ser, live, was_halted = self._ser, self.connected, self._currently_halted
             self._currently_halted = False
+            if was_armed_not_halted and self._pause_pending:
+                self._pause_pending = False
+                logger.info("pending pause cancelled -- the stop it was waiting for was cancelled first")
         if live and ser is not None and was_halted:
             try:
                 ser.write(b"\x04")
@@ -395,6 +425,9 @@ class SerialSessionMonitor:
             with self.lock:
                 self._currently_halted = False
                 self._stop_armed = False
+                if self._pause_pending:
+                    self._pause_pending = False
+                    logger.info("pending pause cancelled -- device reset abandoned the stop it was waiting on")
         else:
             self._hard_reset()
 
@@ -415,9 +448,16 @@ class SerialSessionMonitor:
         # override a deliberate stop.
         self._user_stopped = True
         self._pending_soft_reset_at = None
+        apply_deferred_pause = False
         with self.lock:
             self._stop_armed = False
             self._currently_halted = True
+            if self._pause_pending:
+                self._pause_pending = False
+                self._monitoring_on = False
+                apply_deferred_pause = True
+        if apply_deferred_pause:
+            logger.info("device stop completed -- applying the pause that was waiting on it")
 
     # ------------------------------------------------------------------ #
     # pause / resume monitoring outright (frees the port for mpremote etc)
@@ -429,7 +469,21 @@ class SerialSessionMonitor:
     def pause_monitoring(self):
         """Stop touching the serial port at all -- the run_forever loop
         notices within one read timeout and closes it, so an external
-        tool can open it right after."""
+        tool can open it right after.
+
+        If a device stop is currently armed but hasn't taken effect yet
+        (Stop was pressed, then Pause before it actually connected and
+        halted), this defers the actual pause until the stop completes,
+        rather than closing the port out from under it -- otherwise an
+        armed-but-not-yet-connected stop could never be delivered once
+        monitoring stops trying to open the port at all."""
+        with self.lock:
+            pending_stop = self._stop_armed and not self._currently_halted
+            if pending_stop:
+                self._pause_pending = True
+        if pending_stop:
+            logger.info("pause monitoring requested -- deferring until the pending device stop completes")
+            return
         logger.info("monitoring paused")
         with self.lock:
             self._monitoring_on = False
@@ -438,6 +492,7 @@ class SerialSessionMonitor:
         logger.info("monitoring resumed")
         with self.lock:
             self._monitoring_on = True
+            self._pause_pending = False
 
     # ------------------------------------------------------------------ #
     # read-only helpers for the web UI
@@ -447,6 +502,7 @@ class SerialSessionMonitor:
             return {
                 "connected": self.connected,
                 "monitoring": self._monitoring_on,
+                "pause_pending": self._pause_pending,
                 "stats": dict(self.stats),
                 "last_session_id": self.last_session_id,
                 "stop_armed": self._stop_armed,
