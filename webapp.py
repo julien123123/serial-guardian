@@ -194,11 +194,13 @@ BASE = """
   .tb-icon.lit-cyan  { color: var(--cyan);  filter: drop-shadow(0 0 3px var(--cyan)); }
   .tb-icon.lit-amber { color: var(--amber); filter: drop-shadow(0 0 3px var(--amber)); }
 
-  @keyframes lampFlicker {
-    0%, 49%   { color: var(--amber); filter: drop-shadow(0 0 4px var(--amber)); }
-    50%, 100% { color: var(--ink-dim); filter: none; }
-  }
-  .tb-icon.flashing { animation: lampFlicker 1s steps(1) infinite; }
+  /* Flashing state is a plain color, toggled on/off by a single shared
+     JS timer (see BLINK_INTERVAL_MS below) rather than a per-element CSS
+     animation -- a @keyframes animation restarts its own timeline
+     whenever a class is first added, so two icons that started flashing
+     at different moments would drift out of phase with each other
+     forever. Driving both from one clock keeps them in lockstep. */
+  .tb-icon.flash-on { color: var(--amber); filter: drop-shadow(0 0 4px var(--amber)); }
 
   pre.term {
     background: #0a0c0d; border: none; border-radius: 0; margin: 0;
@@ -307,7 +309,7 @@ def create_app(monitor, cfg):
                 <div class="tb-label">Device</div>
                 <div class="tb-buttons">
                   <button id="stopItem" class="tb-icon"
-                          title="Stop: halt the board at the REPL on its next update instead of sleeping"
+                          title="Stop: halt the board at the REPL on its next update instead of sleeping. Click again while armed (flashing) to cancel."
                           aria-label="Stop device" onclick="doStop()">{ICONS['stop']}</button>
                   <button id="resumeItem" class="tb-icon" style="display:none"
                           title="Resume normal operation" aria-label="Resume device"
@@ -321,7 +323,7 @@ def create_app(monitor, cfg):
                 <div class="tb-label">Monitoring</div>
                 <div class="tb-buttons">
                   <button id="pauseMonItem" class="tb-icon"
-                          title="Pause monitoring: free the serial port for mpremote or a terminal. If a device stop is pending, waits for it to complete first."
+                          title="Pause monitoring: free the serial port for mpremote or a terminal. If a device stop is pending, waits for it to complete first. Click again while queued (flashing) to cancel just the pause."
                           aria-label="Pause monitoring" onclick="doPauseMon()">{ICONS['pause']}</button>
                   <button id="resumeMonItem" class="tb-icon" style="display:none"
                           title="Resume monitoring" aria-label="Resume monitoring"
@@ -355,6 +357,17 @@ def create_app(monitor, cfg):
           }}
           return escd;
         }}
+
+        let lastStatus = null;
+        function applyBlink() {{
+          if (!lastStatus) return;
+          const stopShouldFlash = !!lastStatus.stop_armed && !lastStatus.halted;
+          const pauseShouldFlash = !!lastStatus.pause_pending;
+          document.getElementById('stopItem').classList.toggle('flash-on', stopShouldFlash && blinkOn);
+          document.getElementById('pauseMonItem').classList.toggle('flash-on', pauseShouldFlash && blinkOn);
+        }}
+        let blinkOn = false;
+        setInterval(() => {{ blinkOn = !blinkOn; applyBlink(); }}, 500);
 
         function applyStatus(s) {{
           let dot, label, sub = '';
@@ -390,12 +403,15 @@ def create_app(monitor, cfg):
 
           // Lamp states, like indicator lights on the panel rather than
           // relying on text alone:
-          document.getElementById('stopItem').classList.toggle('flashing', !!s.stop_armed && !s.halted);
           document.getElementById('resetItem').classList.toggle('lit', !!s.connected);
           document.getElementById('resumeItem').classList.toggle('lit-cyan', !!s.halted);
           document.getElementById('resumeMonItem').classList.toggle('lit-amber', !s.monitoring);
-          // Pause flashes too while it's queued behind an armed-not-yet-halted stop.
-          document.getElementById('pauseMonItem').classList.toggle('flashing', !!s.pause_pending);
+
+          // Flashing (Stop while armed-not-halted, Pause while a pause is
+          // queued behind it) is driven by the shared blink clock below
+          // so the two always stay in phase with each other -- see applyBlink().
+          lastStatus = s;
+          applyBlink();
         }}
 
         async function doStop() {{ await fetch('/api/stop', {{method:'POST'}}); }}
@@ -586,7 +602,7 @@ def create_app(monitor, cfg):
         sections = [
             ("Serial link", ["SERIAL_PORT", "BAUD", "SERIAL_READ_TIMEOUT"]),
             ("Detection & recovery", ["GOTOSLEEP_MARKER", "BOOT_BANNER_MARKER", "EXCEPTION_MARKERS",
-                                       "SOFT_RESET_DELAY", "BOOT_TIMEOUT", "STOP_SEND_DELAY"]),
+                                       "SOFT_RESET_DELAY", "BOOT_TIMEOUT"]),
             ("Hardware reset (GPIO)", ["ENABLE_GPIO_RESET", "GPIO_RESET_PIN", "GPIO_RESET_PULSE"]),
             ("Storage & UI", ["NORMAL_LOG_RETENTION", "LIVE_TAIL_LINES",
                                "MONITORING_PAUSE_POLL_INTERVAL", "MIN_FREE_DISK_MB"]),

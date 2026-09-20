@@ -61,9 +61,11 @@ GPIO_RESET_PULSE = 0.25        # seconds to hold RESET low
 # --- Deliberate "stop device on next update" button --------------------
 # Sends Ctrl-C (not Ctrl-D) so the board lands at the REPL and just sits
 # there -- it won't call gotosleep(), so it stays awake and connected until
-# you hit Resume (which sends Ctrl-D) or reset it some other way.
+# you hit Resume (which sends Ctrl-D) or reset it some other way. Sent the
+# instant a connection opens if armed -- no settle delay, since some of
+# this board's wake cycles complete in well under a second and a delay
+# could outlast the whole session.
 STOP_BYTES = b"\x03\x03"
-STOP_SEND_DELAY = 0.4          # settle time after a fresh connect before sending it
 
 # --- Disk usage ------------------------------------------------------------
 # Full raw logs are always kept for EXCEPTION, ANOMALY and STOPPED sessions

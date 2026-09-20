@@ -32,8 +32,6 @@ FIELD_SPECS = [
      "Wait this long after an exception marker before sending the soft-reset keystrokes."),
     ("BOOT_TIMEOUT", "float", "Boot timeout (s)",
      "If no fresh boot banner shows up this long after a soft reset, escalate to hardware reset."),
-    ("STOP_SEND_DELAY", "float", "Stop settle delay (s)",
-     "Settle time after a fresh connect before sending an armed 'stop on next update'."),
     ("ENABLE_GPIO_RESET", "bool", "Enable GPIO hardware reset",
      "Requires wiring, see README. Only ever used as an automatic-recovery fallback, never for manual Stop/Resume."),
     ("GPIO_RESET_PIN", "int", "GPIO reset pin (BCM)",

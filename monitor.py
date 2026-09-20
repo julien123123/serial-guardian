@@ -143,7 +143,6 @@ class SerialSessionMonitor:
         self._is_exception = False
         self._user_stopped = False     # this session's halt was OUR Ctrl-C, not a real bug
         self._pending_soft_reset_at = None
-        self._stop_send_at = None
         self._awaiting_boot = False
         self._boot_deadline = None
 
@@ -197,7 +196,7 @@ class SerialSessionMonitor:
                     self.connected = True
                     self._ser = ser
                 self._begin_session()
-                self._arm_pending_stop_if_requested()
+                self._send_armed_stop_if_any(ser)
 
                 buf = b""
                 # Exits (closing the port via the `with` above) either
@@ -213,7 +212,6 @@ class SerialSessionMonitor:
                             raw, buf = buf.split(b"\n", 1)
                             self._handle_line(ser, raw.decode(errors="ignore") + "\n")
                     self._check_boot_timeout()
-                    self._check_pending_stop(ser)
         except serial.SerialException:
             pass  # board went to sleep / disconnected -- handled below either way
 
@@ -231,11 +229,20 @@ class SerialSessionMonitor:
         self._reset_session_state()
         self._start_ts = time.time()
 
-    def _arm_pending_stop_if_requested(self):
+    def _send_armed_stop_if_any(self, ser):
+        """If a stop was armed while disconnected, deliver it the instant
+        we have a live connection -- before any of the board's own output,
+        and with no artificial delay. There used to be a settle delay here
+        (STOP_SEND_DELAY); it's gone because some of this board's wake
+        cycles complete in well under half a second, shorter than that
+        delay -- the stop would miss its window entirely, stay armed, and
+        just keep re-rolling the dice on the next (also possibly too-short)
+        cycle, sometimes for a long time before a slow-enough wake let it
+        land. Sending first-thing removes the race altogether."""
         with self.lock:
             armed = self._stop_armed
         if armed:
-            self._stop_send_at = time.time() + self.cfg.STOP_SEND_DELAY
+            self._send_stop_keys(ser)
 
     def _handle_line(self, ser, line):
         now = time.time()
@@ -372,12 +379,31 @@ class SerialSessionMonitor:
     # deliberate stop / resume -- called from Flask request threads
     # ------------------------------------------------------------------ #
     def request_stop(self):
-        """Arm a halt for the next time the board is connected. If it's
-        connected right now, send it immediately too."""
-        logger.info("device stop requested")
+        """Arm a halt for the next time the board is connected, sending
+        it immediately if it's connected right now. Calling this again
+        while a stop is already armed but hasn't taken effect yet
+        cancels it instead -- acts as a toggle in that specific state --
+        and drops any pause that was queued behind it too, since there's
+        nothing left for it to wait on."""
         with self.lock:
-            self._stop_armed = True
-            ser, live = self._ser, self.connected
+            if self._stop_armed and not self._currently_halted:
+                self._stop_armed = False
+                had_pending_pause = self._pause_pending
+                self._pause_pending = False
+                cancelled = True
+            else:
+                cancelled = False
+                self._stop_armed = True
+                ser, live = self._ser, self.connected
+
+        if cancelled:
+            logger.info(
+                "pending device stop cancelled%s",
+                " (queued pause also cancelled)" if had_pending_pause else "",
+            )
+            return
+
+        logger.info("device stop requested")
         if live and ser is not None:
             self._send_stop_keys(ser)
 
@@ -431,11 +457,6 @@ class SerialSessionMonitor:
         else:
             self._hard_reset()
 
-    def _check_pending_stop(self, ser):
-        if self._stop_send_at and time.time() >= self._stop_send_at:
-            self._send_stop_keys(ser)
-            self._stop_send_at = None
-
     def _send_stop_keys(self, ser):
         try:
             ser.write(self.cfg.STOP_BYTES)
@@ -476,17 +497,27 @@ class SerialSessionMonitor:
         halted), this defers the actual pause until the stop completes,
         rather than closing the port out from under it -- otherwise an
         armed-but-not-yet-connected stop could never be delivered once
-        monitoring stops trying to open the port at all."""
+        monitoring stops trying to open the port at all. Calling this
+        again while a pause is already queued that way cancels the
+        queued pause instead -- acts as a toggle in that specific state
+        -- leaving the stop itself untouched."""
         with self.lock:
-            pending_stop = self._stop_armed and not self._currently_halted
-            if pending_stop:
+            if self._pause_pending:
+                self._pause_pending = False
+                action = "cancel"
+            elif self._stop_armed and not self._currently_halted:
                 self._pause_pending = True
-        if pending_stop:
+                action = "queue"
+            else:
+                self._monitoring_on = False
+                action = "pause"
+
+        if action == "cancel":
+            logger.info("pending pause cancelled")
+        elif action == "queue":
             logger.info("pause monitoring requested -- deferring until the pending device stop completes")
-            return
-        logger.info("monitoring paused")
-        with self.lock:
-            self._monitoring_on = False
+        else:
+            logger.info("monitoring paused")
 
     def resume_monitoring(self):
         logger.info("monitoring resumed")

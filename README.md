@@ -255,18 +255,27 @@ square for Stop, a triangle for Resume, two bars for Pause. States show up
 as lamp behavior on the keys themselves:
 
 - **Stop** (device) *flashes amber* while armed but not yet in effect —
-  stops the moment it actually halts.
+  stops the moment it actually halts. Click it again while flashing to
+  **cancel** the armed stop instead of re-arming it.
 - **Reset** (device) glows green **only while a serial session is
   currently open** — a live indicator of whether there's a connection for
   the soft-reset keystrokes to land on.
 - **Resume** (device) glows cyan, **Resume** (monitoring) glows amber,
   matching the connection-status lamp's own colors for those states.
 - **Pause** (monitoring) also flashes amber while a pause is *queued*
-  behind a pending Stop — see below.
+  behind a pending Stop — see below. Click it again while flashing to
+  **cancel** just the queued pause, leaving the stop itself untouched.
+- Stop and Pause share one blink clock, so when both happen to be
+  flashing at once they always do it in lockstep rather than drifting out
+  of phase with each other.
 
 **Device** — **Stop** halts the board at the REPL on its next update
 (Ctrl-C) so it stays awake instead of sleeping; **Resume** brings it back
-(Ctrl-D). **Reset** reboots the board right now regardless of whether it's
+(Ctrl-D). Sent the instant a connection opens, with no settle delay —
+some of this board's wake cycles complete in well under a second, and an
+earlier version's delay could outlast the whole session, leaving an armed
+stop stranded for many cycles before a slow-enough wake finally let it
+land. **Reset** reboots the board right now regardless of whether it's
 halted, running normally, or asleep — if connected, the same soft-reset
 keystrokes used for automatic exception recovery (and the same escalation
 to the hardware line if it doesn't come back); if asleep and not connected
@@ -283,9 +292,11 @@ and connect — Guardian defers the pause rather than closing the port out
 from under the pending stop. An armed-but-undelivered stop needs a live
 connection to ever get sent; closing the port first would strand it
 indefinitely. The Pause key flashes amber while queued this way, and the
-pause applies automatically the instant the stop actually completes. If
-you cancel the pending stop instead (Resume or Reset before it fires), the
-queued pause is dropped too rather than silently firing later on its own.
+pause applies automatically the instant the stop actually completes. Both
+Stop and Pause can be cancelled independently by clicking them again while
+flashing; cancelling the stop also drops any pause queued behind it (there's
+nothing left for it to wait on), but cancelling the pause on its own leaves
+the stop armed and running.
 
 The **trash icon** next to Pause/Resume permanently deletes every session
 log and the index, restarting numbering — and resetting the count cards —
