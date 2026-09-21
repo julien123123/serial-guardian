@@ -1,3 +1,5 @@
+<img width="1845" height="1137" alt="image" src="https://github.com/user-attachments/assets/afebb60f-500d-4739-8cae-a15a125ce637" />
+
 # Serial Guardian
 
 Moves your `check.py` monitoring loop off the laptop and onto a Raspberry Pi
