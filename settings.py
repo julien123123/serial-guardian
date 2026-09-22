@@ -33,7 +33,7 @@ FIELD_SPECS = [
     ("BOOT_TIMEOUT", "float", "Boot timeout (s)",
      "If no fresh boot banner shows up this long after a soft reset, escalate to hardware reset."),
     ("ENABLE_GPIO_RESET", "bool", "Enable GPIO hardware reset",
-     "Requires wiring, see README. Only ever used as an automatic-recovery fallback, never for manual Stop/Resume."),
+     "Requires wiring, see docs/GUIDE.md. Only ever used as an automatic-recovery fallback, never for manual Stop/Resume."),
     ("GPIO_RESET_PIN", "int", "GPIO reset pin (BCM)",
      "Which GPIO pin is wired to the board's RESET line."),
     ("GPIO_RESET_PULSE", "float", "GPIO reset pulse (s)",

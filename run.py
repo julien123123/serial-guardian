@@ -10,7 +10,7 @@ Then browse to http://<pi-hostname-or-ip>:8080/
 Serves with waitress (a production-grade WSGI server) if it's installed
 -- `sudo apt install python3-waitress` -- falling back to Flask's own
 development server otherwise, which works fine but isn't meant to be
-left running unattended for long stretches. See README's "if it stops
+left running unattended for long stretches. See docs/GUIDE.md's "if it stops
 responding" section for why this matters.
 """
 import logging
@@ -49,7 +49,7 @@ def main():
         logger.warning(
             "waitress not installed -- falling back to Flask's development server. "
             "Fine for testing; `sudo apt install python3-waitress` is recommended "
-            "for anything left running unattended (see README)."
+            "for anything left running unattended (see docs/GUIDE.md)."
         )
         app.run(host=cfg.WEB_HOST, port=cfg.WEB_PORT, threaded=True)
 

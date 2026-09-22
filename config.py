@@ -50,7 +50,7 @@ SOFT_RESET_BYTES = b"\r\x03\x03\x04"
 BOOT_TIMEOUT = 12
 
 # Hardware reset line, wired from a Pi GPIO pin to the board's RESET pin.
-# See README.md for wiring. Leave this False if you haven't wired it up --
+# See docs/GUIDE.md for wiring. Leave this False if you haven't wired it up --
 # the soft reset alone handles the vast majority of MicroPython exceptions.
 # Only ever used for the automatic exception-recovery path, never for the
 # manual stop/resume buttons below.
@@ -92,5 +92,5 @@ WEB_PORT = 8080
 # --- systemd service control from the web UI --------------------------
 # Must match the unit name installed at /etc/systemd/system/<name>.service
 # (systemd/serial-guardian.service in this repo). Requires the narrowly
-# scoped sudoers rule in systemd/serial-guardian.sudoers -- see README.
+# scoped sudoers rule in systemd/serial-guardian.sudoers -- see docs/GUIDE.md.
 SERVICE_NAME = "serial-guardian"

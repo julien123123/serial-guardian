@@ -50,7 +50,7 @@ watchdog.py's health check, and _finish_session() checks free disk space
 before writing a session's raw text so a full SD card degrades (skips the
 raw log, keeps the index entry, logs a warning) instead of throwing.
 None of this can fix a genuine kernel/USB-level lockup on its own -- see
-the README's "if it stops responding" section for that.
+the docs/GUIDE.md "if it stops responding" section for that.
 """
 
 import collections
