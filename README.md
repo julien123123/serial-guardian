@@ -1,3 +1,5 @@
+<img width="1845" height="1137" alt="image" src="https://github.com/user-attachments/assets/afebb60f-500d-4739-8cae-a15a125ce637" />
+
 # Serial Guardian
 
 A web dashboard that watches a sleeping embedded device's USB serial output
