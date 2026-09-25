@@ -7,9 +7,10 @@ from a low-power always-on SBC (built for a Raspberry Pi Zero W), so you
 don't have to leave a laptop plugged in.
 
 > **Vibecoded.** Every line of code and every doc in this repo — including
-> this README — was written by Claude (Anthropic), in conversation with a
-> human who described the problem, tested it on real hardware, and
-> iterated. No hand-written code. Read it before you trust it.
+> this README — was written with Claude (Anthropic), GitHub Copilot, and
+> Gemini, in conversation with a human who described the problem, tested it
+> on real hardware, and iterated. No hand-written code. Read it before you
+> trust it.
 
 ## The problem this solves
 
@@ -56,6 +57,34 @@ Open `http://yourpi.local:8080`.
 Full install steps (headless Pi setup, wiring, systemd, optional GPIO
 reset, sudoers for the Restart button) and the complete feature reference
 are in **[docs/GUIDE.md](docs/GUIDE.md)**.
+
+## Compile and deploy MicroPython files
+
+`compile_deploy.sh` provides an interactive local workflow for compiling
+`.py` files to `.mpy` files and deploying selected files to the Pi with
+`scp` and `mpremote`.
+
+Install its dependencies on the development computer:
+
+```bash
+sudo apt install -y whiptail openssh-client
+chmod +x compile_deploy.sh
+```
+
+Run it from anywhere:
+
+```bash
+./compile_deploy.sh
+```
+
+The first run asks for the source folder, output folder, `mpy-cross`
+executable, SSH target (for example `pi@guardian.local`), and the remote
+`mpremote` command. These values are saved in
+`~/.config/serial-guardian/compile_deploy.conf`, so later runs go directly
+to the menu. If the script is moved to a different directory, it asks for
+the paths and target again. Use **Settings** in the menu to change them
+without moving the script. The deploy workflow supports selecting multiple
+compiled files at once.
 
 ## Built for
 

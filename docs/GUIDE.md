@@ -106,7 +106,46 @@ python3 run.py
 Browse to `http://guardian.local:8080/` (or the Pi's IP) — you should see
 the live tail scrolling and a green "connected" dot.
 
-## 4. Run it as a service
+## 4. Compile and deploy MicroPython files
+
+The repository also includes `compile_deploy.sh`, an interactive helper for
+compiling MicroPython source files and copying selected compiled files to the
+Pi. It runs on the development computer, not on the Pi.
+
+Install the local dependencies and make the script executable:
+
+```
+sudo apt install -y whiptail openssh-client
+chmod +x compile_deploy.sh
+```
+
+Start it with:
+
+```
+./compile_deploy.sh
+```
+
+On its first run, the script asks for:
+
+- the folder containing the `.py` source files,
+- the folder where `.mpy` files should be written,
+- the path to the executable `mpy-cross`,
+- the SSH target, such as `pi@guardian.local`, and
+- the remote `mpremote` command.
+
+The answers are saved in
+`~/.config/serial-guardian/compile_deploy.conf`. Subsequent runs open
+directly at the menu. If the script is moved to a new directory, it asks
+for the configuration again because its default project-relative paths may
+have changed. To change any value without moving the script, choose
+**Settings** from the menu.
+
+Choose **Compile all .py files** to build everything, or **Deploy selected
+files** to choose one or more existing `.mpy` files. **Compile all, then
+deploy selected files** combines both operations. Selected files are copied
+to the Pi with `scp` and then installed through `mpremote`.
+
+## 5. Run it as a service
 
 ```
 sudo cp systemd/serial-guardian.service /etc/systemd/system/
