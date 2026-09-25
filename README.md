@@ -59,6 +59,7 @@ reset, sudoers for the Restart button) and the complete feature reference
 are in **[docs/GUIDE.md](docs/GUIDE.md)**.
 
 ## Compile and deploy MicroPython files
+<img width="1892" height="1122" alt="image" src="https://github.com/user-attachments/assets/8bf55cec-94a6-437b-aa92-b2026c2b3cb2" />
 
 `compile_deploy.sh` provides an interactive local workflow for compiling
 `.py` files to `.mpy` files and deploying selected files to the Pi with
