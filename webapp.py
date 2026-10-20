@@ -16,9 +16,11 @@ import subprocess
 import threading
 import time
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request
 
+import exporter
 import fields
+import labels
 import settings
 
 STATUS_COLORS = {
@@ -232,6 +234,38 @@ BASE = """
   .meta b { color: var(--ink); }
   footer { text-align: center; color: var(--ink-dim); padding: 2rem 1rem; font-size: 0.78rem; }
 
+  /* Labels: free-standing notes pinned between sessions by timestamp, so
+     they sit in the same place in the log whatever filter is active. */
+  .label-bar { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
+  .label-bar input[type=text] {
+    flex: 1; font-family: var(--mono); font-size: 0.85rem; background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 5px; padding: 0.4rem 0.6rem;
+  }
+  tr.label-row td {
+    background: rgba(232,182,75,0.09); border-left: 3px solid var(--amber);
+    color: var(--ink); padding-top: 0.4rem; padding-bottom: 0.4rem;
+  }
+  tr.label-row:hover td { background: rgba(232,182,75,0.14); }
+  .lbl-flag { color: var(--amber); font-size: 0.7rem; letter-spacing: 0.08em; font-weight: 600; }
+  .lbl-time { color: var(--ink-dim); font-size: 0.78rem; margin: 0 0.6rem; }
+  .lbl-actions { float: right; }
+  .lbl-btn {
+    font-family: var(--mono); font-size: 0.75rem; background: none; color: var(--ink-dim);
+    border: none; cursor: pointer; padding: 0 0.4rem;
+  }
+  .lbl-btn:hover { color: var(--cyan); }
+  .lbl-btn.del:hover { color: var(--red); }
+
+  /* Export panel */
+  .export-opts { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1.3rem; }
+  .export-opts label { display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; }
+  .export-opts select {
+    font-family: var(--mono); font-size: 0.85rem; background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 4px; padding: 0.25rem 0.4rem;
+  }
+  details.panel summary { cursor: pointer; }
+  td.sel, th.sel { width: 1%; padding-right: 0; }
+
   .fc table input {
     font-family: var(--mono); background: var(--bg); color: var(--ink);
     border: 1px solid var(--line); border-radius: 4px; padding: 0.3rem 0.5rem; width: 100%;
@@ -291,7 +325,7 @@ def create_app(monitor, cfg):
         st = monitor.get_status()
         stats_html = "".join(
             f'<a class="stat-link" href="/sessions?status={k}"><div class="stat">'
-            f'<div class="n" style="color:{STATUS_COLORS[k]}">{v}</div>'
+            f'<div class="n" id="stat-{k}" style="color:{STATUS_COLORS[k]}">{v}</div>'
             f'<div class="l">{k}</div></div></a>'
             for k, v in st["stats"].items()
         )
@@ -329,7 +363,7 @@ def create_app(monitor, cfg):
                           title="Resume monitoring" aria-label="Resume monitoring"
                           onclick="doResumeMon()">{ICONS['play']}</button>
                   <button class="tb-icon danger"
-                          title="Erase all session logs and the index (cannot be undone)"
+                          title="Erase all session logs, the index and all labels (cannot be undone)"
                           aria-label="Erase all sessions" onclick="doEraseSessions()">{ICONS['trash']}</button>
                 </div>
               </div>
@@ -390,6 +424,17 @@ def create_app(monitor, cfg):
             '<span class="dot ' + dot + '"></span>' + label +
             ' &nbsp;&middot;&nbsp; last session #' + s.last_session_id;
 
+          // Big counters: update in place on every poll, so they tick up
+          // as sessions finish (and reset to 0 after an erase) without a
+          // page reload.
+          if (s.stats) {{
+            for (const k in s.stats) {{
+              const el = document.getElementById('stat-' + k);
+              const v = String(s.stats[k]);
+              if (el && el.textContent !== v) el.textContent = v;
+            }}
+          }}
+
           // Single line, always -- extra context lives in the hover
           // tooltip instead of a second line, so the console strip's
           // height never jumps around between states.
@@ -424,7 +469,7 @@ def create_app(monitor, cfg):
           try {{ await fetch('/api/service/restart', {{method:'POST'}}); }} catch (e) {{}}
         }}
         async function doEraseSessions() {{
-          if (!confirm('Permanently erase ALL session logs and the index? This cannot be undone.')) return;
+          if (!confirm('Permanently erase ALL session logs, the index and all labels? This cannot be undone.')) return;
           await fetch('/api/sessions/erase', {{method:'POST'}});
         }}
 
@@ -477,6 +522,7 @@ def create_app(monitor, cfg):
     @app.route("/api/sessions/erase", methods=["POST"])
     def api_sessions_erase():
         monitor.erase_all_sessions()
+        labels.clear(cfg)   # labels annotate that history; numbering restarts too
         return jsonify(monitor.get_status())
 
     # ------------------------------------------------------------------ #
@@ -516,7 +562,7 @@ def create_app(monitor, cfg):
         status = request.args.get("status")
         if status not in (None, "NORMAL", "ANOMALY", "EXCEPTION", "STOPPED"):
             status = None
-        records = monitor.recent_sessions(n=200, status=status)
+        records, floor = monitor.recent_sessions_window(n=200, status=status)
         extractors = fields.load(cfg)
 
         def link(label, val):
@@ -530,15 +576,45 @@ def create_app(monitor, cfg):
         )
 
         extra_headers = "".join(f'<th class="extra">{esc(e["name"])}</th>' for e in extractors)
+        ncols = 6 + len(extractors)
+
+        # Labels are pinned by timestamp, NOT by which sessions happen to be
+        # on screen: every label newer than the oldest line the view scanned
+        # is shown, and it's slotted in just above the first session that
+        # started before it. That's why a label stays put under any status
+        # filter -- filtering only removes session rows around it.
+        pending_labels = sorted(
+            (l for l in labels.load(cfg) if l["ts"] >= floor),
+            key=lambda l: l["ts"], reverse=True,
+        )
+
+        def label_row(l):
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(l["ts"]))
+            return (
+                f'<tr class="label-row" data-label-id="{l["id"]}"><td colspan="{ncols}">'
+                f'<span class="lbl-flag">&#9873; LABEL</span>'
+                f'<span class="lbl-time">{when}</span>'
+                f'<span class="lbl-text">{esc(l["text"])}</span>'
+                f'<span class="lbl-actions">'
+                f'<button type="button" class="lbl-btn" onclick="editLabel({l["id"]})">edit</button>'
+                f'<button type="button" class="lbl-btn del" title="Delete label" '
+                f'onclick="deleteLabel({l["id"]})">&times;</button>'
+                f'</span></td></tr>'
+            )
 
         rows = ""
         for r in records:
+            while pending_labels and pending_labels[0]["ts"] > r["start"]:
+                rows += label_row(pending_labels.pop(0))
             color = STATUS_COLORS[r["status"]]
             text = monitor.read_session_text(r["id"])
             values = fields.extract(text, extractors)
             extra_cells = "".join(f'<td class="extra">{esc(values[e["name"]])}</td>' for e in extractors)
             rows += (
                 f'<tr onclick="location.href=\'/sessions/{r["id"]}\'" style="cursor:pointer">'
+                f'<td class="sel" onclick="event.stopPropagation()">'
+                f'<input type="checkbox" class="rowsel" name="ids" value="{r["id"]}" form="exportForm" checked '
+                f'aria-label="Select session {r["id"]} for export"></td>'
                 f'<td>#{r["id"]}</td>'
                 f'<td><span class="badge" style="background:{color}22;color:{color}">{r["status"]}</span></td>'
                 f'<td>{r["duration"]}s</td>'
@@ -547,17 +623,174 @@ def create_app(monitor, cfg):
                 f'<td><a href="/sessions/{r["id"]}">view</a></td>'
                 f'</tr>'
             )
+        for l in pending_labels:      # older than every session shown
+            rows += label_row(l)
+        if not records:
+            rows += f'<tr><td colspan="{ncols}">no sessions recorded yet</td></tr>'
 
         body = f"""
         <div class="filters">{filters}</div>
+
+        <div class="label-bar">
+          <input type="text" id="lblText" maxlength="{labels.MAX_LEN}"
+                 placeholder="Add a label at the current time (e.g. swapped battery)…"
+                 aria-label="New label text">
+          <button class="btn" type="button" onclick="addLabel()">Add label</button>
+        </div>
+
+        <details class="panel" id="exportPanel">
+          <summary>Export</summary>
+          <form id="exportForm" method="post" action="/export" onsubmit="return exportCheck()"
+                style="margin-top:0.7rem">
+            <div class="export-opts">
+              <label><input type="radio" name="scope" value="all" checked> All sessions in history</label>
+              <label><input type="radio" name="scope" value="selected" id="scopeSel">
+                Only the rows checked below <span class="hint" id="selCount"></span></label>
+              <label>Format
+                <select name="format">
+                  <option value="json">JSON</option>
+                  <option value="txt">Plain text</option>
+                </select>
+              </label>
+              <input type="hidden" name="include_labels" value="0">
+              <label><input type="checkbox" name="include_labels" value="1" checked> Include labels</label>
+              <input type="hidden" name="include_logs" value="0">
+              <label><input type="checkbox" name="include_logs" value="1" checked> Include raw log text</label>
+              <button class="btn" type="submit">Download</button>
+            </div>
+            <p class="hint" style="margin:0.6rem 0 0">Unchecking a row switches to
+              &ldquo;only the rows checked&rdquo;. With a hand-picked set, only labels dated within
+              those sessions&rsquo; time span are included. Pruned NORMAL sessions have no raw log,
+              so they export as metadata only.</p>
+          </form>
+        </details>
+
         <table>
-          <tr><th>id</th><th>status</th><th>duration</th><th>size</th>{extra_headers}<th></th></tr>
-          {rows or f'<tr><td colspan="{5 + len(extractors)}">no sessions recorded yet</td></tr>'}
+          <tr><th class="sel"><input type="checkbox" id="selAll" checked aria-label="Select all shown sessions"></th>
+              <th>id</th><th>status</th><th>duration</th><th>size</th>{extra_headers}<th></th></tr>
+          {rows}
         </table>
         <p class="hint" style="margin-top:0.9rem">Extra columns are configured on the
           <a href="/settings">Settings</a> page.</p>
+
+        <script>
+        function selChanged() {{
+          const boxes = document.querySelectorAll('.rowsel');
+          const n = document.querySelectorAll('.rowsel:checked').length;
+          document.getElementById('selCount').textContent = '(' + n + ' of ' + boxes.length + ' shown)';
+          document.getElementById('selAll').checked = boxes.length > 0 && n === boxes.length;
+        }}
+        document.querySelectorAll('.rowsel').forEach(b => b.addEventListener('change', () => {{
+          document.getElementById('scopeSel').checked = true;
+          selChanged();
+        }}));
+        document.getElementById('selAll').addEventListener('change', e => {{
+          document.querySelectorAll('.rowsel').forEach(b => {{ b.checked = e.target.checked; }});
+          document.getElementById('scopeSel').checked = true;
+          selChanged();
+        }});
+        selChanged();
+
+        function exportCheck() {{
+          if (document.getElementById('scopeSel').checked &&
+              !document.querySelector('.rowsel:checked')) {{
+            alert('No sessions are checked. Check at least one row, or export all sessions.');
+            return false;
+          }}
+          return true;
+        }}
+
+        async function labelCall(url, payload) {{
+          const res = await fetch(url, {{
+            method: 'POST', headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify(payload || {{}})
+          }});
+          return res.json();
+        }}
+        async function addLabel() {{
+          const inp = document.getElementById('lblText');
+          const text = inp.value.trim();
+          if (!text) return;
+          const data = await labelCall('/api/labels', {{text: text}});
+          if (data.ok) location.reload(); else alert(data.error || 'could not add label');
+        }}
+        document.getElementById('lblText').addEventListener('keydown', e => {{
+          if (e.key === 'Enter') addLabel();
+        }});
+        async function editLabel(id) {{
+          const row = document.querySelector('tr[data-label-id="' + id + '"]');
+          const cur = row.querySelector('.lbl-text').textContent;
+          const text = prompt('Edit label', cur);
+          if (text === null || text.trim() === cur) return;
+          const data = await labelCall('/api/labels/' + id, {{text: text}});
+          if (data.ok) location.reload(); else alert(data.error || 'could not edit label');
+        }}
+        async function deleteLabel(id) {{
+          if (!confirm('Delete this label?')) return;
+          const data = await labelCall('/api/labels/' + id + '/delete');
+          if (data.ok) location.reload(); else alert(data.error || 'could not delete label');
+        }}
+        </script>
         """
         return render("Sessions", "sessions", body)
+
+    # ------------------------------------------------------------------ #
+    # Labels API
+    # ------------------------------------------------------------------ #
+    @app.route("/api/labels", methods=["GET", "POST"])
+    def api_labels():
+        if request.method == "GET":
+            return jsonify({"labels": labels.load(cfg)})
+        payload = request.get_json(silent=True) or {}
+        label, err = labels.add(cfg, payload.get("text"))
+        if err:
+            return jsonify({"ok": False, "error": err}), 400
+        return jsonify({"ok": True, "label": label})
+
+    @app.route("/api/labels/<int:lid>", methods=["POST"])
+    def api_label_edit(lid):
+        payload = request.get_json(silent=True) or {}
+        label, err = labels.update(cfg, lid, payload.get("text"))
+        if err:
+            return jsonify({"ok": False, "error": err}), 400
+        return jsonify({"ok": True, "label": label})
+
+    @app.route("/api/labels/<int:lid>/delete", methods=["POST"])
+    def api_label_delete(lid):
+        err = labels.delete(cfg, lid)
+        if err:
+            return jsonify({"ok": False, "error": err}), 400
+        return jsonify({"ok": True})
+
+    # ------------------------------------------------------------------ #
+    # Export
+    # ------------------------------------------------------------------ #
+    @app.route("/export", methods=["POST"])
+    def export_sessions():
+        def flag(name):
+            # Unchecked checkboxes send nothing, so the form pairs each one
+            # with a hidden "0". A request that omits the field entirely
+            # (curl, a script) gets the default: on.
+            vals = request.form.getlist(name)
+            return (not vals) or ("1" in vals)
+
+        ids = None
+        if request.form.get("scope") == "selected":
+            try:
+                ids = {int(x) for x in request.form.getlist("ids")}
+            except ValueError:
+                return "bad session id", 400
+            if not ids:
+                return "no sessions selected", 400
+
+        fmt = "txt" if request.form.get("format") == "txt" else "json"
+        gen, filename, mimetype = exporter.build(
+            monitor, cfg, ids=ids, fmt=fmt,
+            with_labels=flag("include_labels"), with_logs=flag("include_logs"),
+        )
+        return Response(gen, mimetype=mimetype, headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        })
 
     @app.route("/sessions/<int:sid>")
     def session_detail(sid):

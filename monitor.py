@@ -553,22 +553,48 @@ class SerialSessionMonitor:
             self.live_tail = collections.deque(self.live_tail, maxlen=self.cfg.LIVE_TAIL_LINES)
 
     def recent_sessions(self, n=100, status=None):
+        return self.recent_sessions_window(n, status)[0]
+
+    def recent_sessions_window(self, n=100, status=None):
+        """Like recent_sessions(), but also returns `floor`: the start time
+        of the oldest index line that was scanned (before any status
+        filtering), or 0.0 if the scan reached the start of the file.
+        The Sessions page uses it to decide which labels belong in the
+        view -- anything newer than `floor` -- so labels show up the same
+        way whichever status filter is active."""
         if not os.path.exists(self.index_path):
-            return []
+            return [], 0.0
+        count = n * 4 if status else n
         try:
             out = subprocess.run(
-                ["tail", "-n", str(n * 4 if status else n), self.index_path],
+                ["tail", "-n", str(count), self.index_path],
                 capture_output=True, text=True, timeout=5,
             )
             lines = out.stdout.splitlines()
         except Exception:
             with open(self.index_path) as f:
-                lines = f.readlines()[-(n * 4 if status else n):]
+                lines = f.readlines()[-count:]
 
         records = [json.loads(l) for l in lines if l.strip()]
+        floor = records[0]["start"] if records and len(lines) >= count else 0.0
         if status:
             records = [r for r in records if r["status"] == status]
-        return list(reversed(records[-n:]))
+        return list(reversed(records[-n:])), floor
+
+    def iter_records(self):
+        """Every index record, oldest first, streamed one line at a time
+        (the index grows forever, so don't slurp it). Used by export."""
+        if not os.path.exists(self.index_path):
+            return
+        with open(self.index_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
     def find_record(self, sid):
         """Look up one session's index metadata by id (small linear grep)."""

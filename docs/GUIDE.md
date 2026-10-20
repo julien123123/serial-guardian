@@ -87,8 +87,8 @@ exception-recovery path, never for the manual Stop/Resume buttons.
 sudo apt update
 sudo apt install -y python3-serial python3-flask python3-waitress git
 mkdir -p /home/pi/serial-guardian
-# copy config.py, monitor.py, webapp.py, fields.py, settings.py, applog.py,
-# sdnotify.py, watchdog.py, run.py, systemd/ here
+# copy config.py, monitor.py, webapp.py, fields.py, labels.py, exporter.py,
+# settings.py, applog.py, sdnotify.py, watchdog.py, run.py, systemd/ here
 #   e.g. scp -r ./pi-serial-guardian/* pi@guardian.local:~/serial-guardian/
 ```
 
@@ -264,6 +264,25 @@ The big count cards on the Live page reflect **everything in `index.jsonl`**,
 restored from disk at startup — not just what's happened since the process
 last started. A restart doesn't zero out counts that reflect hundreds of
 already-recorded sessions; only Erase (see below) does that, deliberately.
+The cards update live as sessions finish — no page refresh needed.
+
+## Labels and export (Sessions page)
+
+**Labels** are short notes you drop into the session log ("swapped battery",
+"firmware v2 flashed"). Type one in the bar above the table and press
+Enter. A label is pinned to the moment you add it, not to a session row, so
+it sits between the sessions around that time and stays in exactly the same
+place whichever status filter is active — filtering only removes the session
+rows around it. Labels can be edited or deleted from their row. They live in
+`data/labels.json`, and Erase removes them along with the sessions.
+
+**Export** (the *Export* panel above the table) downloads sessions as JSON or
+plain text. The default is every session in history, with labels and raw log
+text included. Untick rows in the table to switch to "only the rows
+checked"; with a hand-picked set, only labels dated within those sessions'
+time span are included. Pruned NORMAL sessions have no raw log, so they
+export as metadata only. Plain-text exports print each label inline, where it
+falls between sessions.
 
 ## How the automatic reset works (EXCEPTION only)
 
