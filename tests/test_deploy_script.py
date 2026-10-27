@@ -88,6 +88,7 @@ class DeployScriptTest(unittest.TestCase):
         self.assertEqual(sum(row[0] == 'compiler' for row in rows), 2)
         menu = next(row for row in rows if row[0]=='whiptail' and '--menu' in row)
         items = menu[menu.index('--menu')+5:]
+        self.assertEqual(items[::2], list('123456'))
         self.assertEqual(items[items.index('1')+1], 'Compile all and deploy selected files')
         self.assertEqual(items[items.index('6')+1], '[x] Reset device after transfer')
         self.assertFalse((self.standalone/'deploy_remote.py').exists())

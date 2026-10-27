@@ -407,7 +407,9 @@ number_menu() {
     python3 -c "$(cat <<'NUMBER_MENU_PY'
 import errno, fcntl, os, pty, select, signal, struct, subprocess, sys, termios, tty
 if not sys.stdin.isatty():
-    sys.exit(subprocess.call(sys.argv[1:]))
+    result = subprocess.run(sys.argv[1:], stderr=subprocess.PIPE)
+    sys.stdout.buffer.write(result.stderr)
+    sys.exit(result.returncode)
 terminal = os.open('/dev/tty', os.O_RDWR)
 master, slave = pty.openpty()
 def resize(*args):
@@ -425,7 +427,7 @@ try:
     os.close(slave)
     tty.setraw(terminal)
     signal.signal(signal.SIGWINCH, resize)
-    shortcuts = {ord(key): index for index, key in enumerate('123645')}
+    shortcuts = {ord(key): index for index, key in enumerate('123456')}
     escape = bytearray()
     mouse_bytes = 0
     while process.poll() is None:
@@ -473,13 +475,16 @@ NUMBER_MENU_PY
 main_menu() {
     local reset_mark='[x]'
     if [[ "$RESET_AFTER" == 0 ]]; then reset_mark='[ ]'; fi
+    # The adapter emits the chosen tag on stdout; do not apply whiptail's
+    # usual stderr/stdout swap here or the shell loses the selection.
     number_menu whiptail --title "MicroPython Compile / Deploy" --default-item "$MENU_DEFAULT" \
         --menu "Press 1-6 to activate immediately. Arrows + Enter also work. 6 toggles Reset." 18 85 6 \
         "1" "Compile all and deploy selected files" \
         "2" "Deploy selected built files" \
         "3" "Compile all .py files" \
-        "6" "$reset_mark Reset device after transfer" \
-        "4" "Settings" "5" "Exit" 3>&1 1>&2 2>&3
+        "4" "Settings" \
+        "5" "Exit" \
+        "6" "$reset_mark Reset device after transfer"
 }
 
 while true; do
