@@ -140,23 +140,27 @@ for the configuration again because its default project-relative paths may
 have changed. To change any value without moving the script, choose
 **Settings** from the menu.
 
-Keep `deploy_remote.py` beside `compile_deploy.sh` on the development
-computer. It is staged temporarily on the Pi for each deployment. Python 3,
-`mpremote`, and a running, updated Guardian are required on the Pi. Restart
-Guardian after updating `monitor.py` and `webapp.py`; deployments use the
-new lightweight `/api/status` endpoint. No compiler is installed on the Pi.
+Only `compile_deploy.sh` needs to be copied to your development computer;
+there is no companion Python file to keep beside it. The coordinator is
+embedded in the script and written to a temporary directory when needed,
+then staged on the Pi and cleaned up automatically. Python 3, `mpremote`,
+and a running, updated Guardian are required on the Pi. Restart Guardian
+after updating `monitor.py` and `webapp.py`; deployments use `/api/status`.
+No compiler is installed on the Pi.
 
-The first menu item is **Compile all and deploy selected files**. Press a
-number from 1 to 5 to choose an action immediately, without Enter. Option 2
-deploys existing compiled files; option 3 compiles without deploying. Run
-`./compile_deploy.sh` in an interactive terminal, including PyCharm's built-in
-terminal, since file selection and settings use `whiptail` dialogs.
+The original `whiptail` dialog menu is restored. Its first item is **Compile
+all and deploy selected files**. Use Up/Down to select an item and Enter to
+activate it. Option 2 deploys existing compiled files; option 3 compiles
+without deploying. Run `./compile_deploy.sh` in an interactive terminal,
+including PyCharm's built-in terminal.
 
+**[x] Reset device after transfer** appears on the first menu screen, enabled
+by default. Select this row and press Enter to toggle it to **[ ]**. The
+menu redraws with focus on that row and retains your choice until you exit
+the script; a new run starts checked again. There is no separate reset
+prompt after choosing files. With reset disabled, uploading restores
+monitoring and keeps the device at its REPL for a later manual Reset.
 Every file checklist starts empty; file choices are not remembered.
-After choosing modules, **Deployment options** contains one checkbox:
-**Reset device after transfer**, checked by default. Uncheck it with Space
-to keep the device stopped at its REPL after uploading. Escape cancels the
-deployment before the device is touched.
 
 The coordinated deployment performs these steps:
 

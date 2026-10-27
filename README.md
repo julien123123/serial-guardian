@@ -78,15 +78,17 @@ Run it from anywhere:
 ./compile_deploy.sh
 ```
 
-Keep `deploy_remote.py` beside the shell script. On first run, configure the
+The shell script is self-contained: copy just `compile_deploy.sh` to your
+project. On first run, configure the
 source/output folders, `mpy-cross`, SSH target, and the Pi's `mpremote`
 executable (or `python3 -m mpremote`). Settings are saved in
 `~/.config/serial-guardian/compile_deploy.conf`.
 
-The first menu option is **Compile all and deploy selected files**. Press its
-number to run it immediately; no Enter is needed. Each deployment starts
-with an empty file selection. **Reset device after transfer** is checked by
-default and can be unchecked before deploying.
+The original dialog menu opens with **Compile all and deploy selected
+files** first. Use the arrow keys and Enter. **[x] Reset device after
+transfer** is on that same first screen and enabled by default; select its
+row and press Enter to toggle it before choosing an action. Each deployment
+starts with an empty file selection.
 
 The script handles compile → stage on Pi → stop on next wake → release
 serial → transfer → restore monitoring. With Reset enabled, it also resets

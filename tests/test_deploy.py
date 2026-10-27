@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import deploy_remote
+from deploy_support import deploy_remote
 
 
 class FakeGuardian:

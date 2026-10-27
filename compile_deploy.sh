@@ -195,32 +195,160 @@ choose_files() {
     mapfile -t SELECTED_FILES <<< "$choices"
 }
 
-choose_deploy_options() {
-    local options
-    options="$(whiptail --title "Deployment options" --separate-output --checklist \
-        "Reset is enabled by default. Space toggles; Enter deploys; Escape cancels." \
-        12 80 1 "reset" "Reset device after transfer" "ON" 3>&1 1>&2 2>&3)" || return 1
-    RESET_AFTER=0
-    if [[ "$options" == reset ]]; then RESET_AFTER=1; fi
+# Embedded so this file can be copied and run on its own. Materialized only
+# in a temporary directory for the SSH handoff; Python runs on the Pi.
+write_deploy_helper() {
+    cat <<'GUARDIAN_DEPLOY_PY'
+#!/usr/bin/env python3
+"""Short-lived deployment coordinator, staged on the Pi by compile_deploy.sh."""
+import argparse
+import fcntl
+import json
+import math
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.error
+
+
+class DeploymentError(RuntimeError):
+    pass
+
+
+class Guardian:
+    def __init__(self, url):
+        self.url = url.rstrip('/')
+
+    def call(self, path, post=False):
+        req = urllib.request.Request(self.url + path, data=b'{}' if post else None,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return json.load(response)
+
+    def status(self):
+        try:
+            return self.call('/api/status')
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise DeploymentError('Update and restart Serial Guardian on the Pi first (/api/status unavailable)') from exc
+            raise
+
+
+def wait_for(guardian, predicate, timeout, description):
+    deadline = time.monotonic() + timeout
+    while True:
+        state = guardian.status()
+        if predicate(state):
+            return state
+        if time.monotonic() >= deadline:
+            raise DeploymentError('Timed out: ' + description)
+        time.sleep(0.25)
+
+
+def deploy(guardian, files, mpremote, wait=300, boot_wait=30, transfer_wait=120, reset=True):
+    command = shlex.split(mpremote)
+    if not command or not shutil.which(command[0]):
+        raise DeploymentError('mpremote executable not found on the Pi: ' + mpremote)
+    if not files or any(not Path(path).is_file() for path in files):
+        raise DeploymentError('Staged deployment files are missing')
+    state = guardian.status()  # Fail before stopping anything if Guardian is outdated.
+    required = {'serial_port', 'serial_open', 'boot_count', 'halted', 'monitoring', 'stop_armed'}
+    if not required <= state.keys():
+        raise DeploymentError('Update and restart Serial Guardian on the Pi first')
+    port = state['serial_port']
+    print('Waiting for device wake / Stop to take effect…', flush=True)
+    if not state['monitoring']:
+        guardian.call('/api/monitoring/resume', post=True)
+    # Stop and Pause are toggles. Never blindly retry them.
+    if not state['halted'] and not state['stop_armed']:
+        guardian.call('/api/stop', post=True)
+    queued_pause = state.get('pause_pending', False)
+    wait_for(guardian, lambda s: s['halted'] or (queued_pause and not s['monitoring']
+             and not s['serial_open'] and not s['connected']), wait, 'device Stop')
+    print('Stop sent. Releasing the serial port…', flush=True)
+    state = guardian.status()
+    if state['monitoring'] and not state.get('pause_pending'):
+        guardian.call('/api/monitoring/pause', post=True)
+    wait_for(guardian, lambda s: not s['monitoring'] and not s['serial_open'] and not s['connected'],
+             wait, 'serial port release')
+    print('Serial port released. Transferring {} file(s)…'.format(len(files)), flush=True)
+    # A single mpremote connection, explicit port, no implicit soft reboot.
+    # A partial/failed transfer raises before any resume or reset request.
+    subprocess.run(command + ['connect', port, 'resume', 'fs', 'cp'] + list(files) + [':'],
+                   check=True, timeout=transfer_wait)
+    print('Transfer complete. Restoring monitoring…', flush=True)
+    guardian.call('/api/monitoring/resume', post=True)
+    state = wait_for(guardian, lambda s: s['monitoring'] and s['connected'] and s['serial_open'],
+                     wait, 'monitor reconnect')
+    if not reset:
+        print('Monitoring restored. Device left at the REPL; use Reset in Guardian when ready.', flush=True)
+        return
+    baseline = state['boot_count']
+    guardian.call('/api/device/reset', post=True)
+    print('Reset requested. Waiting for the configured boot marker…', flush=True)
+    wait_for(guardian, lambda s: s['boot_count'] > baseline, boot_wait, 'boot marker (files transferred; inspect Live)')
+    print('Boot detected. Watch the Guardian Live dashboard.', flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--url', default='http://127.0.0.1:8080')
+    parser.add_argument('--mpremote', default='mpremote')
+    parser.add_argument('--wait', type=float, default=300)
+    parser.add_argument('--boot-wait', type=float, default=30)
+    parser.add_argument('--transfer-wait', type=float, default=120)
+    parser.add_argument('--no-reset', action='store_true', help='restore monitoring but leave the board at the REPL')
+    parser.add_argument('files', nargs='+')
+    args = parser.parse_args()
+    if any(not math.isfinite(value) or value <= 0 for value in (args.wait, args.boot_wait, args.transfer_wait)):
+        parser.error('timeouts must be positive')
+    # Serialize cooperating deploy invocations on this Pi, including different
+    # staging directories. The advisory lock is released on every exit path.
+    with open('/tmp/serial-guardian-deploy.lock', 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('Another deployment is running on this Pi.', file=sys.stderr)
+            return 1
+        try:
+            deploy(Guardian(args.url), args.files, args.mpremote,
+                   args.wait, args.boot_wait, args.transfer_wait, reset=not args.no_reset)
+        except (Exception, KeyboardInterrupt) as exc:
+            print('Deployment stopped: {}\nNo further reset/resume will be attempted. '
+                  'If transfer failed, leave the device halted and retry; '
+                  'a pending Stop may need cancellation in the dashboard.'.format(exc), file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+GUARDIAN_DEPLOY_PY
 }
 
 deploy_files() (
-    local filename stage remote_command
+    local filename stage remote_command helper_dir
     local -a local_files=() remote_files=() reset_args=()
     if [[ "$RESET_AFTER" == 0 ]]; then reset_args=(--no-reset); fi
     [[ "$SSH_TARGET" != -* ]] || die "Invalid SSH target"
-    [[ -f "$CURRENT_SCRIPT_DIR/deploy_remote.py" ]] || die "Keep deploy_remote.py beside this script"
     for filename in "${SELECTED_FILES[@]}"; do
         [[ "$filename" != */* && "$filename" != -* && "$filename" != *$'\n'* && "$filename" == *.mpy ]] || die "Invalid module filename"
         [[ -f "$OUTPUT_DIR/$filename" ]] || die "Missing compiled file: $filename; select files again."
         local_files+=("$OUTPUT_DIR/$filename")
     done
     (( ${#local_files[@]} )) || die "No files selected"
+    helper_dir="$(mktemp -d "${TMPDIR:-/tmp}/serial-guardian-helper.XXXXXXXX")" || exit $?
+    trap 'rm -rf -- "$helper_dir"' EXIT
+    write_deploy_helper > "$helper_dir/deploy_remote.py" || exit $?
     echo "Staging ${#local_files[@]} file(s) on $SSH_TARGET…"
     stage="$(ssh -o ConnectTimeout=10 -- "$SSH_TARGET" 'mktemp -d /tmp/serial-guardian-deploy.XXXXXXXX')" || exit $?
     [[ "$stage" =~ ^/tmp/serial-guardian-deploy\.[A-Za-z0-9]+$ ]] || die "Invalid staging directory returned by SSH"
-    trap 'ssh -o ConnectTimeout=10 -- "$SSH_TARGET" "rm -rf -- $stage" </dev/null || true' EXIT
-    scp -- "$CURRENT_SCRIPT_DIR/deploy_remote.py" "${local_files[@]}" "$SSH_TARGET:$stage/" || exit $?
+    trap 'rm -rf -- "$helper_dir"; ssh -o ConnectTimeout=10 -- "$SSH_TARGET" "rm -rf -- $stage" </dev/null || true' EXIT
+    scp -- "$helper_dir/deploy_remote.py" "${local_files[@]}" "$SSH_TARGET:$stage/" || exit $?
     for filename in "${SELECTED_FILES[@]}"; do remote_files+=("$stage/$filename"); done
     remote_command="$(quote_command python3 "$stage/deploy_remote.py" --url "$GUARDIAN_URL" \
         --mpremote "$MPREMOTE" --wait "$DEPLOY_WAIT" --boot-wait "$BOOT_WAIT" \
@@ -230,32 +358,29 @@ deploy_files() (
 
 # ---------- main menu --------------------------------------------------------
 
-main_menu() {
-    local choice
-    cat >&2 <<'MENU'
+RESET_AFTER=1
+MENU_DEFAULT=1
 
-MicroPython Compile / Deploy
-  1  Compile all and deploy selected files
-  2  Deploy selected built files
-  3  Compile all .py files
-  4  Settings
-  5  Exit
-Press a number (no Enter needed):
-MENU
-    while IFS= read -r -s -n 1 choice; do
-        case "$choice" in
-            [1-5]) printf '%s' "$choice"; printf '\n' >&2; return 0 ;;
-            $'\e') printf '5'; return 0 ;;
-            '') ;; # Ignore Enter, including one typed after a number.
-            *) printf 'Choose 1–5: ' >&2 ;;
-        esac
-    done
-    return 1
+main_menu() {
+    local reset_mark='[x]'
+    if [[ "$RESET_AFTER" == 0 ]]; then reset_mark='[ ]'; fi
+    whiptail --title "MicroPython Compile / Deploy" --default-item "$MENU_DEFAULT" \
+        --menu "Choose an operation. Select Reset and press Enter to toggle its check mark." 18 85 6 \
+        "1" "Compile all and deploy selected files" \
+        "2" "Deploy selected built files" \
+        "3" "Compile all .py files" \
+        "R" "$reset_mark Reset device after transfer" \
+        "4" "Settings" "5" "Exit" 3>&1 1>&2 2>&3
 }
 
 while true; do
     MENU_CHOICE="$(main_menu)" || exit 0
+    MENU_DEFAULT=1
     case "$MENU_CHOICE" in
+        R)
+            if [[ "$RESET_AFTER" == 1 ]]; then RESET_AFTER=0; else RESET_AFTER=1; fi
+            MENU_DEFAULT=R
+            ;;
         3)
             if compile_all; then echo "Compile complete."; else echo "Compilation failed; previous build retained."; fi
             ;;
@@ -264,7 +389,6 @@ while true; do
                 compile_all || { echo "Compilation failed; device untouched."; continue; }
             fi
             choose_files || continue
-            choose_deploy_options || continue
             if deploy_files; then
                 if [[ "$RESET_AFTER" == 1 ]]; then
                     whiptail --title "Boot detected" --msgbox "Deployment complete. Watch the Guardian Live dashboard." 8 70

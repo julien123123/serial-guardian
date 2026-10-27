@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -21,13 +22,23 @@ elif name == 'ssh':
     elif not command.startswith('rm '):
         with open(os.environ['REMOTE_ARGS'], 'w') as f: json.dump(shlex.split(command), f)
         sys.exit(int(os.environ.get('FAIL_REMOTE', '0')))
-elif name == 'scp': sys.exit(int(os.environ.get('FAIL_SCP', '0')))
+elif name == 'scp':
+    helper = pathlib.Path(sys.argv[2])
+    source = helper.read_text()
+    compile(source, str(helper), 'exec')
+    pathlib.Path(os.environ['STAGED_HELPER']).write_text(source)
+    sys.exit(int(os.environ.get('FAIL_SCP', '0')))
 elif name == 'whiptail':
-    if '--checklist' in sys.argv:
-        if os.environ.get('CANCEL_OPTIONS') and 'reset' in sys.argv: sys.exit(1)
-        if 'reset' in sys.argv:
-            if not os.environ.get('NO_RESET'): print('reset', file=sys.stderr)
-        else: print("a file.mpy\nb'file.mpy", file=sys.stderr)
+    if '--menu' in sys.argv:
+        if os.environ.get('CANCEL_MENU'): sys.exit(1)
+        counter = pathlib.Path(os.environ['MENU_COUNTER'])
+        count = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(count+1))
+        choices = os.environ.get('MENU_CHOICES', '15')
+        print(choices[count] if count < len(choices) else '5', file=sys.stderr)
+    elif '--checklist' in sys.argv:
+        if os.environ.get('CANCEL_FILES'): sys.exit(1)
+        print("a file.mpy\nb'file.mpy", file=sys.stderr)
 '''
 
 
@@ -36,6 +47,9 @@ class DeployScriptTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.base = Path(tmp.name)
+        self.standalone = self.base / 'standalone'; self.standalone.mkdir()
+        self.script = self.standalone / 'compile_deploy.sh'
+        shutil.copy(ROOT / 'compile_deploy.sh', self.script)
         self.bin = self.base / 'bin'; self.bin.mkdir()
         for tool in ['ssh', 'scp', 'whiptail', 'compiler']:
             path = self.bin / tool; path.write_text(STUB); path.chmod(0o755)
@@ -48,11 +62,11 @@ class DeployScriptTest(unittest.TestCase):
         self.remote = self.base / 'remote-args'
         self.env = dict(os.environ, PATH=str(self.bin)+os.pathsep+os.environ['PATH'],
                         XDG_CONFIG_HOME=str(self.base/'config'), TRACE=str(self.trace),
-                        REMOTE_ARGS=str(self.remote), MENU_COUNTER=str(self.base/'menu-counter'))
+                        REMOTE_ARGS=str(self.remote), MENU_COUNTER=str(self.base/'menu-counter'), STAGED_HELPER=str(self.base/'staged-helper.py'))
         self.write_config()
 
     def write_config(self, remembered=False):
-        values = dict(SCRIPT_DIR=str(ROOT), SOURCE_DIR=str(self.source), OUTPUT_DIR=str(self.output),
+        values = dict(SCRIPT_DIR=str(self.standalone), SOURCE_DIR=str(self.source), OUTPUT_DIR=str(self.output),
                       MPY_CROSS=str(self.bin/'compiler'), SSH_TARGET='pi@test-host', MPREMOTE='python3 -m mpremote')
         if remembered:
             values['LAST_SELECTION_KEY'] = f'{self.source}|{self.output}|pi@test-host'
@@ -62,26 +76,29 @@ class DeployScriptTest(unittest.TestCase):
 
     def run_script(self, *args, **extra):
         menu_input = extra.pop('MENU_INPUT', '15')
-        return subprocess.run(['bash', str(ROOT/'compile_deploy.sh'), *args], env=dict(self.env, **extra),
-                              capture_output=True, text=True, input=menu_input, timeout=15)
+        return subprocess.run(['bash', str(self.script), *args], env=dict(self.env, MENU_CHOICES=menu_input, **extra),
+                              capture_output=True, text=True, timeout=15)
 
     def trace_rows(self):
         return [json.loads(line) for line in self.trace.read_text().splitlines()] if self.trace.exists() else []
 
-    def test_first_option_and_number_keys_run_without_enter(self):
+    def test_standalone_script_restores_dialog_with_checked_reset_on_first_screen(self):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
-        self.assertIn('1  Compile all and deploy selected files', result.stderr)
         rows = self.trace_rows()
         self.assertEqual(sum(row[0] == 'compiler' for row in rows), 2)
-        self.assertFalse(any(row[0] == 'whiptail' and '--menu' in row for row in rows))
+        menu = next(row for row in rows if row[0]=='whiptail' and '--menu' in row)
+        items = menu[menu.index('--menu')+5:]
+        self.assertEqual(items[items.index('1')+1], 'Compile all and deploy selected files')
+        self.assertEqual(items[items.index('R')+1], '[x] Reset device after transfer')
+        self.assertFalse((self.standalone/'deploy_remote.py').exists())
+        self.assertTrue((self.base/'staged-helper.py').is_file())
         args = json.loads(self.remote.read_text())
         self.assertNotIn('--no-reset', args)
         self.assertEqual(args[args.index('--mpremote')+1], 'python3 -m mpremote')
         self.assertEqual(args[-2:], ['/tmp/serial-guardian-deploy.Test1234/a file.mpy', "/tmp/serial-guardian-deploy.Test1234/b'file.mpy"])
         self.assertLess(next(i for i,r in enumerate(rows) if r[0]=='scp'), next(i for i,r in enumerate(rows) if r[0]=='ssh' and 'deploy_remote.py' in r[-1]))
-        options = next(row for row in rows if row[0]=='whiptail' and 'reset' in row)
-        self.assertEqual(options[options.index('reset')+2], 'ON')
+        self.assertFalse(any('Deployment options' in row for row in rows))
 
     def test_selections_start_empty_every_time_even_with_old_config(self):
         self.write_config(remembered=True)
@@ -94,12 +111,16 @@ class DeployScriptTest(unittest.TestCase):
             self.assertEqual(checklist[checklist.index("b'file.mpy")+2], 'OFF')
 
     def test_reset_can_be_disabled(self):
-        result = self.run_script(NO_RESET='1')
+        result = self.run_script(MENU_INPUT='R15')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('--no-reset', json.loads(self.remote.read_text()))
+        menus = [row for row in self.trace_rows() if row[0]=='whiptail' and '--menu' in row]
+        items = menus[1][menus[1].index('--menu')+5:]
+        self.assertEqual(items[items.index('R')+1], '[ ] Reset device after transfer')
+        self.assertEqual(menus[1][menus[1].index('--default-item')+1], 'R')
 
-    def test_cancel_deployment_options_leaves_device_untouched(self):
-        result = self.run_script(CANCEL_OPTIONS='1')
+    def test_cancel_file_selection_leaves_device_untouched(self):
+        result = self.run_script(CANCEL_FILES='1')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any(row[0] in ['ssh','scp'] for row in self.trace_rows()))
 
