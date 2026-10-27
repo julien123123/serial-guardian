@@ -237,37 +237,43 @@ BASE = """
 
   /* Labels: free-standing notes pinned between sessions by timestamp, so
      they sit in the same place in the log whatever filter is active. */
-  .session-table { overflow-x:auto; }
+  /* Let the last separator's control extend below its border without
+     changing the spacing to the hint below the table. */
+  .session-table { overflow-x:auto; padding-bottom:7px; margin-bottom:-7px; }
   .session-tools { display:flex; align-items:flex-start; gap:0.75rem; margin-bottom:0.75rem; }
   .session-tools .filters { flex:1; flex-wrap:wrap; margin:0; }
   .export-control { margin-left:auto; flex:none; }
   .export-control summary {
-    list-style:none; width:58px; height:58px; display:flex; align-items:center;
-    justify-content:center; font-size:0.7rem; text-transform:uppercase; cursor:pointer;
-    background:linear-gradient(#262c2f,#181d1f); border:1px solid #333b3e;
-    box-shadow:inset 0 1px 0 #ffffff0d, 0 1px 2px #0008;
+    list-style:none; padding:0.25rem 0.7rem; border:1px solid var(--line);
+    border-radius:0; color:var(--ink-dim); cursor:pointer;
   }
   .export-control summary::-webkit-details-marker { display:none; }
-  .export-control[open] summary { color:var(--cyan); box-shadow:inset 0 1px 3px #0009; }
-  .export-panel { margin:0 0 1rem auto; width:min(100%, 28rem); border-radius:0; }
-  .export-panel .export-opts { flex-direction:column; align-items:flex-start; }
+  .export-control summary:hover { text-decoration:underline; }
+  .export-control[open] summary { color:var(--bg); background:var(--ink); }
   .export-range { display:flex; gap:0.6rem; flex-wrap:wrap; }
   .export-range input { width:8em; background:var(--bg); color:var(--ink); border:1px solid var(--line); padding:0.4rem; font:inherit; }
   .session-toggle { background:none; border:0; padding:0; font:inherit; color:inherit; cursor:pointer; }
   .session-row { cursor:pointer; }
+  .session-row td { vertical-align:middle; }
   .session-row:has([aria-expanded=true]) td { background:var(--panel); }
   tr.session-log td { padding:0; }
   tr.session-log pre.term { height:auto; max-height:55vh; border-left:2px solid var(--cyan); }
   .log-message { padding:0.75rem; color:var(--ink-dim); }
-  tr.label-gap td { padding:0; height:14px; border:0; position:relative; }
-  .label-insert { display:block; width:100%; height:18px; line-height:16px; padding:0;
-    background:none; border:0; color:var(--amber); cursor:pointer; opacity:0;
-    font:inherit; font-size:16px; }
-  .label-gap:hover .label-insert, .label-insert:focus-visible { opacity:1;
-    background:linear-gradient(transparent 46%,var(--line) 46%,var(--line) 54%,transparent 54%); }
-  .label-editor { display:flex; gap:0.5rem; padding:0.5rem 0; flex-wrap:wrap; }
+  /* Insertion controls overlay the existing border. Closed gaps occupy no
+     space, so every session keeps the table's original vertical rhythm. */
+  tr.label-gap td { padding:0; height:0; border:0; line-height:0; }
+  .label-gap-anchor { position:relative; height:0; }
+  .label-insert {
+    position:absolute; top:-7px; left:0; width:100%; height:14px; padding:0;
+    background:none; border:0; color:var(--ink-dim); cursor:pointer; opacity:0;
+    font:inherit; font-size:14px; line-height:14px; text-align:left; z-index:1;
+  }
+  .label-insert span { display:block; width:2ch; background:var(--bg); }
+  .label-insert:hover, .label-insert:focus-visible { opacity:1; }
+  .label-gap:has(.label-editor) .label-gap-anchor { height:auto; }
+  .label-editor { display:flex; gap:0.5rem; padding:0.5rem 0; flex-wrap:wrap; line-height:1.5; }
   .label-editor input { flex:1; min-width:10em; background:var(--panel); color:var(--ink);
-    border:1px solid var(--amber); padding:0.4rem; font:inherit; }
+    border:1px solid var(--line); padding:0.4rem; font:inherit; }
   @media (hover:none) { .label-insert { opacity:1; } }
   [hidden] { display:none !important; }
   tr.label-row td {
@@ -630,9 +636,9 @@ def create_app(monitor, cfg):
 
         def gap(ts):
             return (
-                f'<tr class="label-gap"><td colspan="{ncols}">'
+                f'<tr class="label-gap"><td colspan="{ncols}"><div class="label-gap-anchor">'
                 f'<button type="button" class="label-insert" data-ts="{ts}" '
-                f'aria-label="Add label here" title="Add label here">+</button></td></tr>'
+                f'aria-label="Add label here" title="Add label here"><span>+</span></button></div></td></tr>'
             )
 
         rows = ""
