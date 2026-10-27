@@ -9,8 +9,8 @@ Two formats:
 Built as a generator so a large export streams out one session at a time
 instead of loading every log into the Pi Zero's RAM.
 
-Labels follow the time span of the matching sessions when a status or
-number range is supplied. Both metadata scans and log output stream, so
+Labels follow the time span of the matching sessions when a status,
+selection, or number range is supplied. Both metadata scans and log output stream, so
 export memory does not grow with the number of matching sessions.
 """
 import datetime
@@ -29,17 +29,20 @@ def _label_json(l):
 
 
 def build(monitor, cfg, fmt="json", with_labels=True, with_logs=True,
-          status=None, from_id=None, to_id=None):
+          status=None, from_id=None, to_id=None, ids=None):
     """Returns (generator_of_str, filename, mimetype).
 
     Status and inclusive session-number bounds are intersected. None means
-    no restriction for that field. No session-selection list is retained.
+    no restriction for that field. Optional ids restricts output to a set of
+    explicitly selected sessions without retaining their records in memory.
     """
     extractors = fields.load(cfg)
     all_labels = labels.load(cfg) if with_labels else []
 
     def matching_records():
         for rec in monitor.iter_records():
+            if ids is not None and rec["id"] not in ids:
+                continue
             if status is not None and rec["status"] != status:
                 continue
             if from_id is not None and rec["id"] < from_id:
@@ -49,7 +52,7 @@ def build(monitor, cfg, fmt="json", with_labels=True, with_logs=True,
             yield rec
 
     chosen_labels = all_labels
-    if all_labels and (status is not None or from_id is not None or to_id is not None):
+    if all_labels and (ids is not None or status is not None or from_id is not None or to_id is not None):
         # First pass reads only index metadata. No list of matching records or
         # raw logs accumulates in memory, even for an export spanning months.
         lo, hi = float("inf"), float("-inf")

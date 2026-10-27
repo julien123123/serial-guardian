@@ -39,6 +39,26 @@ class SessionsTest(unittest.TestCase):
         self.assertEqual([r['id'] for r in self.export(from_id='4')['sessions']], [4, 5])
         self.assertEqual(self.export(status='ANOMALY', from_id='5')['sessions'], [])
 
+    def test_export_modes_intersect_filter_and_ignore_other_modes(self):
+        self.assertEqual([r['id'] for r in self.export(scope='all', status='ANOMALY', from_id='4')['sessions']], [2, 4])
+        self.assertEqual([r['id'] for r in self.export(scope='selected', status='ANOMALY', ids=['1', '2', '4'], from_id='4')['sessions']], [2, 4])
+        self.assertEqual([r['id'] for r in self.export(scope='range', status='ANOMALY', from_id='3', to_id='4', ids=['2'])['sessions']], [4])
+        for data in [dict(scope='selected'), dict(scope='selected', ids='bad'), dict(scope='selected', ids='0'), dict(scope='range'), dict(scope='bad')]:
+            with self.subTest(data=data):
+                self.assertEqual(self.client.post('/export', data=data).status_code, 400)
+        labels.add(self.cfg, 'inside', ts=1021)
+        labels.add(self.cfg, 'outside', ts=1041)
+        self.assertEqual([l['text'] for l in self.export(scope='selected', ids=['2'])['labels']], ['inside'])
+
+    def test_live_label_uses_same_timeline_storage(self):
+        page = self.client.get('/').text
+        self.assertIn('id="liveLabelToggle"', page)
+        self.assertIn('id="liveLabelForm"', page)
+        result = self.client.post('/api/labels', json=dict(text='Battery changed live', ts=1035))
+        self.assertEqual(result.status_code, 200)
+        self.assertIn('Battery changed live', self.client.get('/sessions').text)
+        self.assertIn('Battery changed live', self.client.get('/sessions?status=ANOMALY').text)
+
     def test_bad_export_input(self):
         for data in [dict(from_id='0'), dict(to_id='-1'), dict(from_id='5', to_id='2'), dict(from_id='1.5'), dict(status='BAD')]:
             with self.subTest(data=data):

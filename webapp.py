@@ -37,6 +37,10 @@ STATUS_COLORS = {
 # the usual refresh/power glyphs. All use currentColor so CSS state
 # classes (.lit / .flashing / etc) can recolor them.
 ICONS = {
+    "export": ('<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" '
+               'stroke-linecap="round" stroke-linejoin="round">'
+               '<path d="M10 3v9M6.5 8.5 10 12l3.5-3.5M4 13v4h12v-4"/></svg>'),
+
     "stop": '<svg viewBox="0 0 20 20" fill="currentColor"><rect x="6" y="6" width="8" height="8"/></svg>',
     "play": '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M7 5 L15 10 L7 15 Z"/></svg>',
     "pause": '<svg viewBox="0 0 20 20" fill="currentColor"><rect x="6" y="5" width="3" height="10"/><rect x="11" y="5" width="3" height="10"/></svg>',
@@ -244,12 +248,24 @@ BASE = """
   .session-tools .filters { flex:1; flex-wrap:wrap; margin:0; }
   .export-control { margin-left:auto; flex:none; }
   .export-control summary {
-    list-style:none; padding:0.25rem 0.7rem; border:1px solid var(--line);
+    list-style:none; width:31px; height:31px; display:flex; align-items:center;
+    justify-content:center; border:1px solid var(--line);
     border-radius:0; color:var(--ink-dim); cursor:pointer;
   }
   .export-control summary::-webkit-details-marker { display:none; }
-  .export-control summary:hover { text-decoration:underline; }
+  .export-control summary svg { width:16px; height:16px; }
+  .export-control summary:hover { color:var(--ink); }
   .export-control[open] summary { color:var(--bg); background:var(--ink); }
+  .export-scopes { display:flex; gap:1.3rem; flex-wrap:wrap; border:0; padding:0; margin:0 0 0.8rem; }
+  .export-scopes legend { padding:0; margin-bottom:0.4rem; }
+  .export-scopes label { display:inline-flex; align-items:center; gap:0.4rem; }
+  .export-scopes input { margin:0; accent-color:var(--ink-dim); }
+  .session-table.selecting .session-row:hover td { background:rgba(91,201,201,0.05); }
+  .session-table.selecting .session-row.is-selected td { background:rgba(91,201,201,0.12); }
+  .session-table.selecting .session-row.is-selected td:first-child { color:var(--cyan); }
+  .live-label-editor { padding:0.6rem 0.9rem; border-bottom:1px solid var(--line); background:var(--panel); }
+  .live-label-editor .label-editor { padding:0; margin:0; }
+  .live-label-editor .hint { margin:0.35rem 0 0; }
   .export-range { display:flex; gap:0.6rem; flex-wrap:wrap; }
   .export-range input { width:8em; background:var(--bg); color:var(--ink); border:1px solid var(--line); padding:0.4rem; font:inherit; }
   .session-toggle { background:none; border:0; padding:0; font:inherit; color:inherit; cursor:pointer; }
@@ -401,6 +417,13 @@ def create_app(monitor, cfg):
                 </div>
               </div>
               <div class="tb-group">
+                <div class="tb-label">Timeline</div>
+                <div class="tb-buttons">
+                  <button id="liveLabelToggle" class="tb-icon" type="button" title="Add label"
+                          aria-label="Add label" aria-expanded="false" aria-controls="liveLabelEditor">+</button>
+                </div>
+              </div>
+              <div class="tb-group">
                 <div class="tb-label">Service</div>
                 <div class="tb-buttons">
                   <button class="tb-icon"
@@ -410,9 +433,57 @@ def create_app(monitor, cfg):
               </div>
             </div>
           </div>
+          <div class="live-label-editor" id="liveLabelEditor" hidden>
+            <form class="label-editor" id="liveLabelForm">
+              <input id="liveLabelText" type="text" maxlength="{labels.MAX_LEN}" required
+                     placeholder="Write a label…" aria-label="Label text">
+              <button class="btn" type="submit">Add label</button>
+              <button class="btn" type="button" id="liveLabelCancel">Cancel</button>
+            </form>
+            <p class="hint" id="liveLabelFeedback" role="status">Pinned to the moment you opened this editor.</p>
+          </div>
           <pre class="term" id="tail"></pre>
         </div>
         <script>
+        const liveLabelToggle = document.getElementById('liveLabelToggle');
+        const liveLabelEditor = document.getElementById('liveLabelEditor');
+        const liveLabelForm = document.getElementById('liveLabelForm');
+        const liveLabelInput = document.getElementById('liveLabelText');
+        const liveLabelFeedback = document.getElementById('liveLabelFeedback');
+        let liveLabelTime = null;
+        function closeLiveLabel() {{
+          liveLabelEditor.hidden = true;
+          liveLabelToggle.setAttribute('aria-expanded', 'false');
+          liveLabelToggle.focus();
+        }}
+        liveLabelToggle.addEventListener('click', () => {{
+          if (!liveLabelEditor.hidden) {{ closeLiveLabel(); return; }}
+          liveLabelTime = Date.now() / 1000;
+          liveLabelFeedback.textContent = 'Pinned to the moment you opened this editor.';
+          liveLabelEditor.hidden = false;
+          liveLabelToggle.setAttribute('aria-expanded', 'true');
+          liveLabelInput.focus();
+        }});
+        document.getElementById('liveLabelCancel').addEventListener('click', closeLiveLabel);
+        liveLabelForm.addEventListener('keydown', e => {{
+          if (e.key === 'Escape') {{ e.preventDefault(); closeLiveLabel(); }}
+        }});
+        liveLabelForm.addEventListener('submit', async e => {{
+          e.preventDefault();
+          const save = liveLabelForm.querySelector('[type=submit]');
+          save.disabled = true;
+          try {{
+            const res = await fetch('/api/labels', {{method:'POST', headers:{{'Content-Type':'application/json'}},
+              body:JSON.stringify({{text:liveLabelInput.value, ts:liveLabelTime}})}});
+            const data = await res.json();
+            if (!res.ok || !data.ok) throw new Error(data.error || 'Could not save label.');
+            liveLabelInput.value = '';
+            liveLabelFeedback.textContent = 'Label saved to the timeline.';
+            liveLabelTime = Date.now() / 1000;
+            liveLabelInput.focus();
+          }} catch (err) {{ liveLabelFeedback.textContent = err.message || 'Could not save label. Please retry.'; }}
+          finally {{ save.disabled = false; }}
+        }});
         const EXC_MARKERS = {exc_markers_json};
         function fmt(line) {{
           const escd = line.replace(/&/g,'&amp;').replace(/</g,'&lt;');
@@ -676,18 +747,24 @@ def create_app(monitor, cfg):
         <div class="session-tools">
           <div class="filters">{filters}</div>
           <details class="export-control" id="exportPanel">
-            <summary aria-label="Export options" aria-controls="exportOptions">Export</summary>
+            <summary title="Export" aria-label="Export" aria-controls="exportOptions">{ICONS['export']}</summary>
           </details>
         </div>
         <div class="panel export-panel" id="exportOptions" hidden>
           <form id="exportForm" method="post" action="/export">
             <input type="hidden" name="status" value="{status or ''}">
-            <p class="hint">{filter_name} sessions in history. Leave the range blank to export this filter.</p>
+            <fieldset class="export-scopes">
+              <legend class="hint">{filter_name} sessions</legend>
+              <label><input type="radio" name="scope" value="all" checked> All</label>
+              <label><input type="radio" name="scope" value="selected"> Selected</label>
+              <label><input type="radio" name="scope" value="range"> Range</label>
+            </fieldset>
+            <p class="hint" id="exportScopeHelp" role="status">All sessions matching the current filter.</p>
+            <div class="export-range" id="exportRange" hidden style="margin-bottom:0.8rem">
+              <label>From # <input type="number" name="from_id" min="1" step="1" aria-label="First session number" disabled></label>
+              <label>To # <input type="number" name="to_id" min="1" step="1" aria-label="Last session number" disabled></label>
+            </div>
             <div class="export-opts">
-              <div class="export-range">
-                <label>From # <input type="number" name="from_id" min="1" step="1" aria-label="First session number"></label>
-                <label>To # <input type="number" name="to_id" min="1" step="1" aria-label="Last session number"></label>
-              </div>
               <label>Format <select name="format"><option value="json">JSON</option><option value="txt">Plain text</option></select></label>
               <input type="hidden" name="include_labels" value="0">
               <label><input type="checkbox" name="include_labels" value="1" checked> Include labels</label>
@@ -695,8 +772,7 @@ def create_app(monitor, cfg):
               <label><input type="checkbox" name="include_logs" value="1" checked> Include raw log text</label>
               <button class="btn" type="submit">Export</button>
             </div>
-            <p class="hint">Range endpoints are included; the status filter always applies.
-            Pruned logs export as metadata only.</p>
+            <p class="hint">The status filter applies in every mode. Pruned logs export as metadata only.</p>
           </form>
         </div>
         <div class="session-table"><table>
@@ -706,22 +782,80 @@ def create_app(monitor, cfg):
         <p class="hint" style="margin-top:0.9rem">Extra columns are configured on the
           <a href="/settings">Settings</a> page.</p>
         <script>
-        document.getElementById('exportPanel').addEventListener('toggle', e => {{
-          document.getElementById('exportOptions').hidden = !e.target.open;
+        const exportPanel = document.getElementById('exportPanel');
+        const exportForm = document.getElementById('exportForm');
+        const selectedSessions = new Set();
+        let logRequest = 0;
+        const scope = () => exportForm.elements.scope.value;
+        const selecting = () => exportPanel.open && scope() === 'selected';
+        function closeLogs() {{
+          ++logRequest;
+          document.querySelectorAll('.session-log').forEach(log => {{ log.hidden = true; log.firstElementChild.replaceChildren(); }});
+          document.querySelectorAll('.session-toggle').forEach(b => b.setAttribute('aria-expanded', 'false'));
+        }}
+        function updateExportMode() {{
+          const active = selecting();
+          document.querySelector('.session-table').classList.toggle('selecting', active);
+          document.getElementById('exportRange').hidden = scope() !== 'range';
+          document.querySelectorAll('.export-range input').forEach(input => {{
+            input.disabled = scope() !== 'range'; input.setCustomValidity('');
+          }});
+          const help = document.getElementById('exportScopeHelp');
+          help.textContent = scope() === 'selected'
+            ? selectedSessions.size + ' selected. Click session rows to select or deselect them.'
+            : scope() === 'range' ? 'Enter inclusive session numbers. Either endpoint can be left blank.'
+            : 'All sessions matching the current filter.';
+          document.querySelectorAll('.session-row').forEach(row => {{
+            const button = row.querySelector('button');
+            row.classList.toggle('is-selected', selectedSessions.has(row.dataset.sessionId));
+            if (active) {{
+              button.setAttribute('aria-pressed', String(selectedSessions.has(row.dataset.sessionId)));
+              button.removeAttribute('aria-expanded');
+            }} else {{
+              button.removeAttribute('aria-pressed');
+              if (!button.hasAttribute('aria-expanded')) button.setAttribute('aria-expanded', 'false');
+            }}
+            row.title = active ? 'Select session for export' : 'View session';
+            button.title = row.title;
+            button.setAttribute('aria-label', (active ? 'Select session ' : 'View session ') + row.dataset.sessionId);
+          }});
+        }}
+        exportPanel.addEventListener('toggle', () => {{
+          document.getElementById('exportOptions').hidden = !exportPanel.open;
+          closeLogs(); updateExportMode();
         }});
-        document.getElementById('exportForm').addEventListener('submit', e => {{
-          const from = e.target.elements.from_id, to = e.target.elements.to_id;
-          if (from.value && to.value && Number(from.value) > Number(to.value)) {{
-            e.preventDefault(); to.setCustomValidity('Last session must be at least the first.'); to.reportValidity();
+        exportForm.querySelectorAll('[name=scope]').forEach(radio => radio.addEventListener('change', () => {{
+          closeLogs(); updateExportMode();
+        }}));
+        exportForm.addEventListener('submit', e => {{
+          exportForm.querySelectorAll('[name=ids]').forEach(input => input.remove());
+          const from = exportForm.elements.from_id, to = exportForm.elements.to_id;
+          if (scope() === 'selected') {{
+            if (!selectedSessions.size) {{
+              e.preventDefault(); document.getElementById('exportScopeHelp').textContent = 'Select at least one session row.'; return;
+            }}
+            selectedSessions.forEach(id => {{
+              const input = document.createElement('input'); input.type = 'hidden'; input.name = 'ids'; input.value = id; exportForm.append(input);
+            }});
+          }} else if (scope() === 'range') {{
+            if (!from.value && !to.value) {{
+              e.preventDefault(); from.setCustomValidity('Enter at least one session number.'); from.reportValidity();
+            }} else if (from.value && to.value && Number(from.value) > Number(to.value)) {{
+              e.preventDefault(); to.setCustomValidity('Last session must be at least the first.'); to.reportValidity();
+            }}
           }}
         }});
         document.querySelectorAll('.export-range input').forEach(input => input.addEventListener('input', () => {{
-          document.querySelector('[name=to_id]').setCustomValidity('');
+          document.querySelectorAll('.export-range input').forEach(field => field.setCustomValidity(''));
         }}));
-        let logRequest = 0;
         document.querySelectorAll('.session-row').forEach(row => {{
           const button = row.querySelector('button');
           row.addEventListener('click', async () => {{
+            if (selecting()) {{
+              const id = row.dataset.sessionId;
+              if (selectedSessions.has(id)) selectedSessions.delete(id); else selectedSessions.add(id);
+              updateExportMode(); return;
+            }}
             const requestId = ++logRequest;
             const card = document.getElementById(button.getAttribute('aria-controls'));
             const opening = card.hidden;
@@ -743,9 +877,8 @@ def create_app(monitor, cfg):
               cell.replaceChildren(pre);
             }} catch (err) {{ if (!card.hidden && requestId === logRequest) cell.textContent = err.message; }}
           }});
-          // Native delayed tooltip follows the pointer without a timer loop.
-          row.title = 'View session';
         }});
+        updateExportMode();
         async function labelCall(url, payload) {{
           const res = await fetch(url, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload || {{}})}});
           return res.json();
@@ -838,17 +971,32 @@ def create_app(monitor, cfg):
         status = request.form.get("status") or None
         if status is not None and status not in STATUS_COLORS:
             return "invalid status filter", 400
-        try:
-            lo = int(request.form["from_id"]) if request.form.get("from_id") else None
-            hi = int(request.form["to_id"]) if request.form.get("to_id") else None
-        except ValueError:
-            return "invalid session range", 400
-        if (lo is not None and lo < 1) or (hi is not None and hi < 1) or (lo is not None and hi is not None and lo > hi):
-            return "invalid session range", 400
+        # Keep requests from older API clients (without scope) compatible.
+        scope = request.form.get("scope") or ("range" if request.form.get("from_id") or request.form.get("to_id") else "all")
+        if scope not in ("all", "selected", "range"):
+            return "invalid export scope", 400
+        ids, lo, hi = None, None, None
+        if scope == "selected":
+            try:
+                ids = {int(value) for value in request.form.getlist("ids")}
+            except ValueError:
+                return "invalid session selection", 400
+            if not ids or any(sid < 1 for sid in ids):
+                return "select at least one valid session", 400
+        elif scope == "range":
+            try:
+                lo = int(request.form["from_id"]) if request.form.get("from_id") else None
+                hi = int(request.form["to_id"]) if request.form.get("to_id") else None
+            except ValueError:
+                return "invalid session range", 400
+            if lo is None and hi is None:
+                return "enter at least one session number", 400
+            if (lo is not None and lo < 1) or (hi is not None and hi < 1) or (lo is not None and hi is not None and lo > hi):
+                return "invalid session range", 400
 
         fmt = "txt" if request.form.get("format") == "txt" else "json"
         gen, filename, mimetype = exporter.build(
-            monitor, cfg, status=status, from_id=lo, to_id=hi, fmt=fmt,
+            monitor, cfg, status=status, ids=ids, from_id=lo, to_id=hi, fmt=fmt,
             with_labels=flag("include_labels"), with_logs=flag("include_logs"),
         )
         return Response(gen, mimetype=mimetype, headers={

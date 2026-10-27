@@ -282,14 +282,26 @@ so changing status filters only removes the session rows around it. Labels
 can be edited or deleted from their strip. They live in `data/labels.json`,
 and Erase removes them along with the sessions.
 
-**Export** is the square control at the right of the session filters. Click
-it to unroll the export settings below the controls. Exports always follow
-the active status filter across history: Anomaly exports only ANOMALY
-sessions, All exports every status. Optional **From #** and **To #** bounds
-narrow that set by inclusive session numbers; either bound can be left blank.
-There are no row-selection checkboxes. JSON and plain text are available,
-with optional labels and raw log text. When a filter or number range is
-active, only labels within the matching sessions' time span are included.
+On **Live**, use the **+** in the Timeline toolbar group to open a label
+editor without leaving or pausing the monitor. The label is pinned to the
+moment you opened the editor, so you can describe an event while output
+continues. Saving confirms the note inline; it appears in the Sessions
+timeline. Cancel or Escape closes the editor.
+
+**Export** is the arrow-to-tray icon at the right of the session filters
+(hover for its name). Click it to unroll the full-width export settings.
+Choose one of three modes: **All** (the default) exports the entire matching
+history; **Selected** lets you click session rows to toggle their highlight;
+**Range** uses inclusive **From #** and **To #** session numbers. At least
+one range endpoint is required; the other can be left blank. Row clicks
+select only while Selected mode is active and the export panel is open;
+otherwise they open the inline log. Closing the panel or switching modes
+hides the highlights but remembers the selection until you leave the page.
+There are no row-selection checkboxes. The active status filter applies in
+all three modes: Anomaly exports only ANOMALY sessions. JSON and plain text
+are available, with optional labels and raw log text. When a filter,
+selection, or number range is active, only labels within the matching
+sessions' time span are included.
 Pruned NORMAL sessions export as metadata only. Plain-text exports print
 each label where it falls between sessions. Export streams one log at a
 time rather than retaining all matching sessions in memory.
