@@ -12,6 +12,7 @@ the Pi on your network. Fine on a trusted home LAN, worth knowing if
 that's not your situation.
 """
 import json
+import math
 import subprocess
 import threading
 import time
@@ -236,17 +237,44 @@ BASE = """
 
   /* Labels: free-standing notes pinned between sessions by timestamp, so
      they sit in the same place in the log whatever filter is active. */
-  .label-bar { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
-  .label-bar input[type=text] {
-    flex: 1; font-family: var(--mono); font-size: 0.85rem; background: var(--bg); color: var(--ink);
-    border: 1px solid var(--line); border-radius: 5px; padding: 0.4rem 0.6rem;
+  .session-table { overflow-x:auto; }
+  .session-tools { display:flex; align-items:flex-start; gap:0.75rem; margin-bottom:0.75rem; }
+  .session-tools .filters { flex:1; flex-wrap:wrap; margin:0; }
+  .export-control { margin-left:auto; flex:none; }
+  .export-control summary {
+    list-style:none; width:58px; height:58px; display:flex; align-items:center;
+    justify-content:center; font-size:0.7rem; text-transform:uppercase; cursor:pointer;
+    background:linear-gradient(#262c2f,#181d1f); border:1px solid #333b3e;
+    box-shadow:inset 0 1px 0 #ffffff0d, 0 1px 2px #0008;
   }
+  .export-control summary::-webkit-details-marker { display:none; }
+  .export-control[open] summary { color:var(--cyan); box-shadow:inset 0 1px 3px #0009; }
+  .export-panel { margin:0 0 1rem auto; width:min(100%, 28rem); border-radius:0; }
+  .export-panel .export-opts { flex-direction:column; align-items:flex-start; }
+  .export-range { display:flex; gap:0.6rem; flex-wrap:wrap; }
+  .export-range input { width:8em; background:var(--bg); color:var(--ink); border:1px solid var(--line); padding:0.4rem; font:inherit; }
+  .session-toggle { background:none; border:0; padding:0; font:inherit; color:inherit; cursor:pointer; }
+  .session-row { cursor:pointer; }
+  .session-row:has([aria-expanded=true]) td { background:var(--panel); }
+  tr.session-log td { padding:0; }
+  tr.session-log pre.term { height:auto; max-height:55vh; border-left:2px solid var(--cyan); }
+  .log-message { padding:0.75rem; color:var(--ink-dim); }
+  tr.label-gap td { padding:0; height:14px; border:0; position:relative; }
+  .label-insert { display:block; width:100%; height:18px; line-height:16px; padding:0;
+    background:none; border:0; color:var(--amber); cursor:pointer; opacity:0;
+    font:inherit; font-size:16px; }
+  .label-gap:hover .label-insert, .label-insert:focus-visible { opacity:1;
+    background:linear-gradient(transparent 46%,var(--line) 46%,var(--line) 54%,transparent 54%); }
+  .label-editor { display:flex; gap:0.5rem; padding:0.5rem 0; flex-wrap:wrap; }
+  .label-editor input { flex:1; min-width:10em; background:var(--panel); color:var(--ink);
+    border:1px solid var(--amber); padding:0.4rem; font:inherit; }
+  @media (hover:none) { .label-insert { opacity:1; } }
+  [hidden] { display:none !important; }
   tr.label-row td {
     background: rgba(232,182,75,0.09); border-left: 3px solid var(--amber);
     color: var(--ink); padding-top: 0.4rem; padding-bottom: 0.4rem;
   }
   tr.label-row:hover td { background: rgba(232,182,75,0.14); }
-  .lbl-flag { color: var(--amber); font-size: 0.7rem; letter-spacing: 0.08em; font-weight: 600; }
   .lbl-time { color: var(--ink-dim); font-size: 0.78rem; margin: 0 0.6rem; }
   .lbl-actions { float: right; }
   .lbl-btn {
@@ -264,7 +292,6 @@ BASE = """
     border: 1px solid var(--line); border-radius: 4px; padding: 0.25rem 0.4rem;
   }
   details.panel summary { cursor: pointer; }
-  td.sel, th.sel { width: 1%; padding-right: 0; }
 
   .fc table input {
     font-family: var(--mono); background: var(--bg); color: var(--ink);
@@ -576,7 +603,7 @@ def create_app(monitor, cfg):
         )
 
         extra_headers = "".join(f'<th class="extra">{esc(e["name"])}</th>' for e in extractors)
-        ncols = 6 + len(extractors)
+        ncols = 4 + len(extractors)
 
         # Labels are pinned by timestamp, NOT by which sessions happen to be
         # on screen: every label newer than the oldest line the view scanned
@@ -592,7 +619,6 @@ def create_app(monitor, cfg):
             when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(l["ts"]))
             return (
                 f'<tr class="label-row" data-label-id="{l["id"]}"><td colspan="{ncols}">'
-                f'<span class="lbl-flag">&#9873; LABEL</span>'
                 f'<span class="lbl-time">{when}</span>'
                 f'<span class="lbl-text">{esc(l["text"])}</span>'
                 f'<span class="lbl-actions">'
@@ -602,133 +628,158 @@ def create_app(monitor, cfg):
                 f'</span></td></tr>'
             )
 
+        def gap(ts):
+            return (
+                f'<tr class="label-gap"><td colspan="{ncols}">'
+                f'<button type="button" class="label-insert" data-ts="{ts}" '
+                f'aria-label="Add label here" title="Add label here">+</button></td></tr>'
+            )
+
         rows = ""
-        for r in records:
-            while pending_labels and pending_labels[0]["ts"] > r["start"]:
-                rows += label_row(pending_labels.pop(0))
+        # Merge labels and sessions before adding insertion points. A midpoint
+        # timestamp anchors each strip in the timeline, including filtered views.
+        timeline = [(r["start"], "session", r) for r in records]
+        timeline += [(l["ts"], "label", l) for l in pending_labels]
+        timeline.sort(key=lambda item: item[0], reverse=True)
+        for i, (ts, kind, item) in enumerate(timeline):
+            above = timeline[i-1][0] if i else max(time.time(), ts + 0.002)
+            rows += gap((above + ts) / 2)
+            if kind == "label":
+                rows += label_row(item)
+                continue
+            r = item
             color = STATUS_COLORS[r["status"]]
-            text = monitor.read_session_text(r["id"])
+            text = monitor.read_session_text(r["id"]) if extractors else None
             values = fields.extract(text, extractors)
             extra_cells = "".join(f'<td class="extra">{esc(values[e["name"]])}</td>' for e in extractors)
             rows += (
-                f'<tr onclick="location.href=\'/sessions/{r["id"]}\'" style="cursor:pointer">'
-                f'<td class="sel" onclick="event.stopPropagation()">'
-                f'<input type="checkbox" class="rowsel" name="ids" value="{r["id"]}" form="exportForm" checked '
-                f'aria-label="Select session {r["id"]} for export"></td>'
-                f'<td>#{r["id"]}</td>'
+                f'<tr class="session-row" data-session-id="{r["id"]}">'
+                f'<td><button type="button" class="session-toggle" title="View session" '
+                f'aria-label="View session {r["id"]}" aria-expanded="false" '
+                f'aria-controls="log-{r["id"]}">#{r["id"]}</button></td>'
                 f'<td><span class="badge" style="background:{color}22;color:{color}">{r["status"]}</span></td>'
-                f'<td>{r["duration"]}s</td>'
-                f'<td>{r["lines"]} lines</td>'
-                f'{extra_cells}'
-                f'<td><a href="/sessions/{r["id"]}">view</a></td>'
-                f'</tr>'
+                f'<td>{r["duration"]}s</td><td>{r["lines"]} lines</td>{extra_cells}</tr>'
+                f'<tr class="session-log" id="log-{r["id"]}" hidden><td colspan="{ncols}"></td></tr>'
             )
-        for l in pending_labels:      # older than every session shown
-            rows += label_row(l)
+        rows += gap(max(0, timeline[-1][0] - 0.002) if timeline else time.time())
         if not records:
             rows += f'<tr><td colspan="{ncols}">no sessions recorded yet</td></tr>'
 
+        filter_name = status.title() if status else "All"
         body = f"""
-        <div class="filters">{filters}</div>
-
-        <div class="label-bar">
-          <input type="text" id="lblText" maxlength="{labels.MAX_LEN}"
-                 placeholder="Add a label at the current time (e.g. swapped battery)…"
-                 aria-label="New label text">
-          <button class="btn" type="button" onclick="addLabel()">Add label</button>
+        <div class="session-tools">
+          <div class="filters">{filters}</div>
+          <details class="export-control" id="exportPanel">
+            <summary aria-label="Export options" aria-controls="exportOptions">Export</summary>
+          </details>
         </div>
-
-        <details class="panel" id="exportPanel">
-          <summary>Export</summary>
-          <form id="exportForm" method="post" action="/export" onsubmit="return exportCheck()"
-                style="margin-top:0.7rem">
+        <div class="panel export-panel" id="exportOptions" hidden>
+          <form id="exportForm" method="post" action="/export">
+            <input type="hidden" name="status" value="{status or ''}">
+            <p class="hint">{filter_name} sessions in history. Leave the range blank to export this filter.</p>
             <div class="export-opts">
-              <label><input type="radio" name="scope" value="all" checked> All sessions in history</label>
-              <label><input type="radio" name="scope" value="selected" id="scopeSel">
-                Only the rows checked below <span class="hint" id="selCount"></span></label>
-              <label>Format
-                <select name="format">
-                  <option value="json">JSON</option>
-                  <option value="txt">Plain text</option>
-                </select>
-              </label>
+              <div class="export-range">
+                <label>From # <input type="number" name="from_id" min="1" step="1" aria-label="First session number"></label>
+                <label>To # <input type="number" name="to_id" min="1" step="1" aria-label="Last session number"></label>
+              </div>
+              <label>Format <select name="format"><option value="json">JSON</option><option value="txt">Plain text</option></select></label>
               <input type="hidden" name="include_labels" value="0">
               <label><input type="checkbox" name="include_labels" value="1" checked> Include labels</label>
               <input type="hidden" name="include_logs" value="0">
               <label><input type="checkbox" name="include_logs" value="1" checked> Include raw log text</label>
-              <button class="btn" type="submit">Download</button>
+              <button class="btn" type="submit">Export</button>
             </div>
-            <p class="hint" style="margin:0.6rem 0 0">Unchecking a row switches to
-              &ldquo;only the rows checked&rdquo;. With a hand-picked set, only labels dated within
-              those sessions&rsquo; time span are included. Pruned NORMAL sessions have no raw log,
-              so they export as metadata only.</p>
+            <p class="hint">Range endpoints are included; the status filter always applies.
+            Pruned logs export as metadata only.</p>
           </form>
-        </details>
-
-        <table>
-          <tr><th class="sel"><input type="checkbox" id="selAll" checked aria-label="Select all shown sessions"></th>
-              <th>id</th><th>status</th><th>duration</th><th>size</th>{extra_headers}<th></th></tr>
-          {rows}
-        </table>
+        </div>
+        <div class="session-table"><table>
+          <thead><tr><th>id</th><th>status</th><th>duration</th><th>size</th>{extra_headers}</tr></thead>
+          <tbody>{rows}</tbody>
+        </table></div>
         <p class="hint" style="margin-top:0.9rem">Extra columns are configured on the
           <a href="/settings">Settings</a> page.</p>
-
         <script>
-        function selChanged() {{
-          const boxes = document.querySelectorAll('.rowsel');
-          const n = document.querySelectorAll('.rowsel:checked').length;
-          document.getElementById('selCount').textContent = '(' + n + ' of ' + boxes.length + ' shown)';
-          document.getElementById('selAll').checked = boxes.length > 0 && n === boxes.length;
-        }}
-        document.querySelectorAll('.rowsel').forEach(b => b.addEventListener('change', () => {{
-          document.getElementById('scopeSel').checked = true;
-          selChanged();
-        }}));
-        document.getElementById('selAll').addEventListener('change', e => {{
-          document.querySelectorAll('.rowsel').forEach(b => {{ b.checked = e.target.checked; }});
-          document.getElementById('scopeSel').checked = true;
-          selChanged();
+        document.getElementById('exportPanel').addEventListener('toggle', e => {{
+          document.getElementById('exportOptions').hidden = !e.target.open;
         }});
-        selChanged();
-
-        function exportCheck() {{
-          if (document.getElementById('scopeSel').checked &&
-              !document.querySelector('.rowsel:checked')) {{
-            alert('No sessions are checked. Check at least one row, or export all sessions.');
-            return false;
+        document.getElementById('exportForm').addEventListener('submit', e => {{
+          const from = e.target.elements.from_id, to = e.target.elements.to_id;
+          if (from.value && to.value && Number(from.value) > Number(to.value)) {{
+            e.preventDefault(); to.setCustomValidity('Last session must be at least the first.'); to.reportValidity();
           }}
-          return true;
-        }}
-
-        async function labelCall(url, payload) {{
-          const res = await fetch(url, {{
-            method: 'POST', headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify(payload || {{}})
+        }});
+        document.querySelectorAll('.export-range input').forEach(input => input.addEventListener('input', () => {{
+          document.querySelector('[name=to_id]').setCustomValidity('');
+        }}));
+        let logRequest = 0;
+        document.querySelectorAll('.session-row').forEach(row => {{
+          const button = row.querySelector('button');
+          row.addEventListener('click', async () => {{
+            const requestId = ++logRequest;
+            const card = document.getElementById(button.getAttribute('aria-controls'));
+            const opening = card.hidden;
+            // One log at a time; release the previous DOM text on close.
+            document.querySelectorAll('.session-log').forEach(log => {{ log.hidden = true; log.firstElementChild.replaceChildren(); }});
+            document.querySelectorAll('.session-toggle').forEach(b => b.setAttribute('aria-expanded', 'false'));
+            if (!opening) return;
+            card.hidden = false; button.setAttribute('aria-expanded', 'true');
+            const cell = card.firstElementChild;
+            cell.textContent = 'Loading session…';
+            try {{
+              const res = await fetch('/api/sessions/' + row.dataset.sessionId + '/log');
+              if (!res.ok) throw new Error('Could not load session. Close and reopen to retry.');
+              const data = await res.json();
+              if (card.hidden || requestId !== logRequest) return;
+              const pre = document.createElement('pre'); pre.className = 'term';
+              pre.textContent = data.log === null ? 'Raw log unavailable (pruned or missing).' : data.log;
+              if (data.truncated) pre.textContent += '\\n… Preview limited to 64K characters. Export this session for the full log.';
+              cell.replaceChildren(pre);
+            }} catch (err) {{ if (!card.hidden && requestId === logRequest) cell.textContent = err.message; }}
           }});
+          // Native delayed tooltip follows the pointer without a timer loop.
+          row.title = 'View session';
+        }});
+        async function labelCall(url, payload) {{
+          const res = await fetch(url, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload || {{}})}});
           return res.json();
         }}
-        async function addLabel() {{
-          const inp = document.getElementById('lblText');
-          const text = inp.value.trim();
-          if (!text) return;
-          const data = await labelCall('/api/labels', {{text: text}});
-          if (data.ok) location.reload(); else alert(data.error || 'could not add label');
-        }}
-        document.getElementById('lblText').addEventListener('keydown', e => {{
-          if (e.key === 'Enter') addLabel();
-        }});
+        document.querySelectorAll('.label-insert').forEach(button => button.addEventListener('click', () => {{
+          document.querySelectorAll('.label-editor').forEach(editor => editor.remove());
+          const form = document.createElement('form'); form.className = 'label-editor';
+          const input = document.createElement('input'); input.type = 'text'; input.maxLength = {labels.MAX_LEN};
+          input.required = true; input.placeholder = 'Write a label…'; input.setAttribute('aria-label', 'Label text');
+          const save = document.createElement('button'); save.className = 'btn'; save.textContent = 'Add label';
+          const cancel = document.createElement('button'); cancel.className = 'btn'; cancel.type = 'button'; cancel.textContent = 'Cancel';
+          const close = () => {{ form.remove(); button.focus(); }};
+          cancel.onclick = close;
+          form.addEventListener('keydown', e => {{ if (e.key === 'Escape') {{ e.preventDefault(); close(); }} }});
+          form.append(input, save, cancel); button.parentElement.append(form); input.focus();
+          form.addEventListener('submit', async e => {{
+            e.preventDefault(); save.disabled = true;
+            try {{
+              const data = await labelCall('/api/labels', {{text:input.value, ts:Number(button.dataset.ts)}});
+              if (data.ok) location.reload(); else alert(data.error || 'Could not add label');
+            }} catch (err) {{ alert('Could not save label. Please retry.'); }}
+            finally {{ save.disabled = false; }}
+          }});
+        }}));
         async function editLabel(id) {{
           const row = document.querySelector('tr[data-label-id="' + id + '"]');
           const cur = row.querySelector('.lbl-text').textContent;
           const text = prompt('Edit label', cur);
           if (text === null || text.trim() === cur) return;
-          const data = await labelCall('/api/labels/' + id, {{text: text}});
-          if (data.ok) location.reload(); else alert(data.error || 'could not edit label');
+          try {{
+            const data = await labelCall('/api/labels/' + id, {{text:text}});
+            if (data.ok) location.reload(); else alert(data.error || 'Could not edit label');
+          }} catch (err) {{ alert('Could not edit label. Please retry.'); }}
         }}
         async function deleteLabel(id) {{
           if (!confirm('Delete this label?')) return;
-          const data = await labelCall('/api/labels/' + id + '/delete');
-          if (data.ok) location.reload(); else alert(data.error || 'could not delete label');
+          try {{
+            const data = await labelCall('/api/labels/' + id + '/delete');
+            if (data.ok) location.reload(); else alert(data.error || 'Could not delete label');
+          }} catch (err) {{ alert('Could not delete label. Please retry.'); }}
         }}
         </script>
         """
@@ -742,7 +793,11 @@ def create_app(monitor, cfg):
         if request.method == "GET":
             return jsonify({"labels": labels.load(cfg)})
         payload = request.get_json(silent=True) or {}
-        label, err = labels.add(cfg, payload.get("text"))
+        ts = payload.get("ts")
+        if ts is not None:
+            if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts) or ts < 0:
+                return jsonify({"ok": False, "error": "invalid label position"}), 400
+        label, err = labels.add(cfg, payload.get("text"), ts=ts)
         if err:
             return jsonify({"ok": False, "error": err}), 400
         return jsonify({"ok": True, "label": label})
@@ -774,23 +829,34 @@ def create_app(monitor, cfg):
             vals = request.form.getlist(name)
             return (not vals) or ("1" in vals)
 
-        ids = None
-        if request.form.get("scope") == "selected":
-            try:
-                ids = {int(x) for x in request.form.getlist("ids")}
-            except ValueError:
-                return "bad session id", 400
-            if not ids:
-                return "no sessions selected", 400
+        status = request.form.get("status") or None
+        if status is not None and status not in STATUS_COLORS:
+            return "invalid status filter", 400
+        try:
+            lo = int(request.form["from_id"]) if request.form.get("from_id") else None
+            hi = int(request.form["to_id"]) if request.form.get("to_id") else None
+        except ValueError:
+            return "invalid session range", 400
+        if (lo is not None and lo < 1) or (hi is not None and hi < 1) or (lo is not None and hi is not None and lo > hi):
+            return "invalid session range", 400
 
         fmt = "txt" if request.form.get("format") == "txt" else "json"
         gen, filename, mimetype = exporter.build(
-            monitor, cfg, ids=ids, fmt=fmt,
+            monitor, cfg, status=status, from_id=lo, to_id=hi, fmt=fmt,
             with_labels=flag("include_labels"), with_logs=flag("include_logs"),
         )
         return Response(gen, mimetype=mimetype, headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
         })
+
+    @app.route("/api/sessions/<int:sid>/log")
+    def session_log(sid):
+        if monitor.find_record(sid) is None:
+            return jsonify({"error": "unknown session"}), 404
+        limit = 64 * 1024
+        text = monitor.read_session_text(sid, max_chars=limit + 1)
+        return jsonify({"log": text[:limit] if text is not None else None,
+                        "truncated": text is not None and len(text) > limit})
 
     @app.route("/sessions/<int:sid>")
     def session_detail(sid):

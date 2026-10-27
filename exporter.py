@@ -9,10 +9,9 @@ Two formats:
 Built as a generator so a large export streams out one session at a time
 instead of loading every log into the Pi Zero's RAM.
 
-Labels: with "all sessions", every label is exported. With a hand-picked
-set of sessions, only labels dated within that set's time span (earliest
-start to latest end) are -- a note from months before the exported
-sessions would just be noise.
+Labels follow the time span of the matching sessions when a status or
+number range is supplied. Both metadata scans and log output stream, so
+export memory does not grow with the number of matching sessions.
 """
 import datetime
 import json
@@ -29,32 +28,42 @@ def _label_json(l):
     return {"id": l["id"], "ts": l["ts"], "time": _iso(l["ts"]), "text": l["text"]}
 
 
-def build(monitor, cfg, ids=None, fmt="json", with_labels=True, with_logs=True):
+def build(monitor, cfg, fmt="json", with_labels=True, with_logs=True,
+          status=None, from_id=None, to_id=None):
     """Returns (generator_of_str, filename, mimetype).
 
-    ids: set of session ids to export, or None for every session in the index.
+    Status and inclusive session-number bounds are intersected. None means
+    no restriction for that field. No session-selection list is retained.
     """
     extractors = fields.load(cfg)
     all_labels = labels.load(cfg) if with_labels else []
 
-    if ids is None:
-        records = monitor.iter_records()          # streamed, never held in memory
-        chosen_labels = all_labels
-    else:
-        recs = [r for r in monitor.iter_records() if r["id"] in ids]
-        records = iter(recs)
-        if recs:
-            lo = min(r["start"] for r in recs)
-            hi = max(r["start"] + r["duration"] for r in recs)
-            chosen_labels = [l for l in all_labels if lo <= l["ts"] <= hi]
-        else:
-            chosen_labels = []
+    def matching_records():
+        for rec in monitor.iter_records():
+            if status is not None and rec["status"] != status:
+                continue
+            if from_id is not None and rec["id"] < from_id:
+                continue
+            if to_id is not None and rec["id"] > to_id:
+                continue
+            yield rec
+
+    chosen_labels = all_labels
+    if all_labels and (status is not None or from_id is not None or to_id is not None):
+        # First pass reads only index metadata. No list of matching records or
+        # raw logs accumulates in memory, even for an export spanning months.
+        lo, hi = float("inf"), float("-inf")
+        for rec in matching_records():
+            lo = min(lo, rec["start"])
+            hi = max(hi, rec["start"] + rec["duration"])
+        chosen_labels = [l for l in all_labels if lo <= l["ts"] <= hi]
+    records = matching_records()
 
     now = datetime.datetime.now().astimezone()
     stamp = now.strftime("%Y%m%d-%H%M%S")
 
     def entry(rec):
-        text = monitor.read_session_text(rec["id"])   # None if pruned
+        text = monitor.read_session_text(rec["id"]) if with_logs or extractors else None
         e = {
             "id": rec["id"],
             "status": rec["status"],

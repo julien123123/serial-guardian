@@ -2,7 +2,8 @@
 Free-standing labels (timeline notes) for the Sessions page.
 
 A label is a short note you drop into the session log -- "swapped the
-battery", "firmware v2 flashed" -- pinned to the moment you added it.
+battery", "firmware v2 flashed" -- pinned to its chosen timeline position (or the
+current time for API clients that omit a position).
 Labels are NOT attached to a session row; they sit between sessions at
 their timestamp, so they show up in the same place in the log whatever
 status filter is active (see the /sessions route in webapp.py).
@@ -74,7 +75,7 @@ def add(cfg, text, ts=None):
         items = _read(cfg)
         label = {
             "id": max((l["id"] for l in items), default=0) + 1,
-            "ts": round(ts or time.time(), 3),
+            "ts": ts if ts is not None else time.time(),
             "text": text,
         }
         items.append(label)

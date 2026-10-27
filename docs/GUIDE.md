@@ -268,21 +268,31 @@ The cards update live as sessions finish — no page refresh needed.
 
 ## Labels and export (Sessions page)
 
-**Labels** are short notes you drop into the session log ("swapped battery",
-"firmware v2 flashed"). Type one in the bar above the table and press
-Enter. A label is pinned to the moment you add it, not to a session row, so
-it sits between the sessions around that time and stays in exactly the same
-place whichever status filter is active — filtering only removes the session
-rows around it. Labels can be edited or deleted from their row. They live in
-`data/labels.json`, and Erase removes them along with the sessions.
+Click a session row (or focus its number and press Enter) to unroll its log
+underneath it. Click again to close. Only one card is open at a time; logs
+are fetched on demand, with a 64K-character preview limit to keep memory and
+network use small on the Zero. Export a single-number range for the full log.
 
-**Export** (the *Export* panel above the table) downloads sessions as JSON or
-plain text. The default is every session in history, with labels and raw log
-text included. Untick rows in the table to switch to "only the rows
-checked"; with a hand-picked set, only labels dated within those sessions'
-time span are included. Pruned NORMAL sessions have no raw log, so they
-export as metadata only. Plain-text exports print each label inline, where it
-falls between sessions.
+**Labels** are short notes you place along the timeline ("swapped battery",
+"firmware v2 flashed"). Hover between rows, or at either end, to reveal a
+**+**; click it, type your note, and press Enter. Keyboard users can Tab to
+the insertion controls; touch devices show them without hovering. Cancel
+or Escape closes the editor. The label is pinned to that timeline position,
+so changing status filters only removes the session rows around it. Labels
+can be edited or deleted from their strip. They live in `data/labels.json`,
+and Erase removes them along with the sessions.
+
+**Export** is the square control at the right of the session filters. Click
+it to unroll the export settings below the controls. Exports always follow
+the active status filter across history: Anomaly exports only ANOMALY
+sessions, All exports every status. Optional **From #** and **To #** bounds
+narrow that set by inclusive session numbers; either bound can be left blank.
+There are no row-selection checkboxes. JSON and plain text are available,
+with optional labels and raw log text. When a filter or number range is
+active, only labels within the matching sessions' time span are included.
+Pruned NORMAL sessions export as metadata only. Plain-text exports print
+each label where it falls between sessions. Export streams one log at a
+time rather than retaining all matching sessions in memory.
 
 ## How the automatic reset works (EXCEPTION only)
 

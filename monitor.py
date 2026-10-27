@@ -614,12 +614,12 @@ class SerialSessionMonitor:
             pass
         return None
 
-    def read_session_text(self, sid):
+    def read_session_text(self, sid, max_chars=None):
         matches = glob.glob(os.path.join(self.sessions_dir, f"{sid:06d}_*.log"))
         if not matches:
             return None
         with open(matches[0]) as f:
-            return f.read()
+            return f.read(max_chars) if max_chars is not None else f.read()
 
     # ------------------------------------------------------------------ #
     # erase all history -- called from a Flask request thread
