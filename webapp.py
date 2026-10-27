@@ -46,7 +46,7 @@ ICONS = {
     "pause": '<svg viewBox="0 0 20 20" fill="currentColor"><rect x="6" y="5" width="3" height="10"/><rect x="11" y="5" width="3" height="10"/></svg>',
     "reset": ('<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" '
               'stroke-linecap="round" stroke-linejoin="round">'
-              '<path d="M15.5 7A6 6 0 1 1 14 4.2"/><path d="M11.5 3.3 L15.5 4.2 L14.6 8.2"/></svg>'),
+              '<path d="M15.2 7A6 6 0 1 1 10 4H15"/><path d="M12 1L15 4L12 7"/></svg>'),
     "trash": ('<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" '
               'stroke-linecap="round" stroke-linejoin="round">'
               '<path d="M4 6h12"/><path d="M8 6V4h4v2"/><path d="M6 6l1 10h6l1-10"/>'
@@ -263,9 +263,19 @@ BASE = """
   .session-table.selecting .session-row:hover td { background:rgba(91,201,201,0.05); }
   .session-table.selecting .session-row.is-selected td { background:rgba(91,201,201,0.12); }
   .session-table.selecting .session-row.is-selected td:first-child { color:var(--cyan); }
-  .live-label-editor { padding:0.6rem 0.9rem; border-bottom:1px solid var(--line); background:var(--panel); }
-  .live-label-editor .label-editor { padding:0; margin:0; }
-  .live-label-editor .hint { margin:0.35rem 0 0; }
+  .monitor-screen { height:55vh; display:flex; flex-direction:column; background:#0a0c0d; }
+  .monitor-screen pre.term { flex:1; min-height:0; height:auto; }
+  .terminal-label-line { padding:0 1rem 0.7rem; }
+  .terminal-key { font:inherit; color:var(--ink-dim); border:0; padding:0;
+    background:none; cursor:pointer; }
+  .terminal-key:hover { color:var(--ink); }
+  .terminal-label-form { display:flex; align-items:baseline; gap:1ch; flex-wrap:wrap; margin:0; }
+  .terminal-label-form .prompt { color:var(--ink-dim); white-space:nowrap; }
+  .terminal-label-form input { flex:1; min-width:10ch; width:0; padding:0;
+    font:inherit; color:var(--ink); background:none; border:0; border-bottom:1px solid var(--line); border-radius:0; }
+  .terminal-label-form input:focus-visible { outline:none; border-bottom-color:var(--ink-dim); }
+  .terminal-label-form button:disabled { opacity:0.45; cursor:default; }
+  .live-label-editor .hint { margin:0.3rem 0 0; font-size:0.78rem; }
   .export-range { display:flex; gap:0.6rem; flex-wrap:wrap; }
   .export-range input { width:8em; background:var(--bg); color:var(--ink); border:1px solid var(--line); padding:0.4rem; font:inherit; }
   .session-toggle { background:none; border:0; padding:0; font:inherit; color:inherit; cursor:pointer; }
@@ -280,7 +290,7 @@ BASE = """
   tr.label-gap td { padding:0; height:0; border:0; line-height:0; }
   .label-gap-anchor { position:relative; height:0; }
   .label-insert {
-    position:absolute; top:-7px; left:0; width:100%; height:14px; padding:0;
+    position:absolute; top:-7px; left:0; width:20%; height:14px; padding:0;
     background:none; border:0; color:var(--ink-dim); cursor:pointer; opacity:0;
     font:inherit; font-size:14px; line-height:14px; text-align:left; z-index:1;
   }
@@ -417,13 +427,6 @@ def create_app(monitor, cfg):
                 </div>
               </div>
               <div class="tb-group">
-                <div class="tb-label">Timeline</div>
-                <div class="tb-buttons">
-                  <button id="liveLabelToggle" class="tb-icon" type="button" title="Add label"
-                          aria-label="Add label" aria-expanded="false" aria-controls="liveLabelEditor">+</button>
-                </div>
-              </div>
-              <div class="tb-group">
                 <div class="tb-label">Service</div>
                 <div class="tb-buttons">
                   <button class="tb-icon"
@@ -433,16 +436,23 @@ def create_app(monitor, cfg):
               </div>
             </div>
           </div>
-          <div class="live-label-editor" id="liveLabelEditor" hidden>
-            <form class="label-editor" id="liveLabelForm">
-              <input id="liveLabelText" type="text" maxlength="{labels.MAX_LEN}" required
-                     placeholder="Write a label…" aria-label="Label text">
-              <button class="btn" type="submit">Add label</button>
-              <button class="btn" type="button" id="liveLabelCancel">Cancel</button>
-            </form>
-            <p class="hint" id="liveLabelFeedback" role="status">Pinned to the moment you opened this editor.</p>
+          <div class="monitor-screen">
+            <pre class="term" id="tail"></pre>
+            <div class="terminal-label-line">
+              <button id="liveLabelToggle" class="terminal-key" type="button" title="Add label"
+                      aria-label="Add label" aria-expanded="false" aria-controls="liveLabelEditor">+</button>
+              <div class="live-label-editor" id="liveLabelEditor" hidden>
+                <form class="terminal-label-form" id="liveLabelForm">
+                  <label class="prompt" for="liveLabelText">&gt; label</label>
+                  <input id="liveLabelText" type="text" maxlength="{labels.MAX_LEN}" required
+                         autocomplete="off" placeholder="Write a label…" aria-label="Label text">
+                  <button class="terminal-key" type="submit" aria-label="Add label">[save]</button>
+                  <button class="terminal-key" type="button" id="liveLabelCancel">[cancel]</button>
+                </form>
+                <p class="hint" id="liveLabelFeedback" role="status"></p>
+              </div>
+            </div>
           </div>
-          <pre class="term" id="tail"></pre>
         </div>
         <script>
         const liveLabelToggle = document.getElementById('liveLabelToggle');
@@ -451,18 +461,25 @@ def create_app(monitor, cfg):
         const liveLabelInput = document.getElementById('liveLabelText');
         const liveLabelFeedback = document.getElementById('liveLabelFeedback');
         let liveLabelTime = null;
+        function setLiveLabelOpen(open) {{
+          const tail = document.getElementById('tail');
+          const following = tail.scrollTop + tail.clientHeight >= tail.scrollHeight - 20;
+          const offset = tail.scrollTop;
+          liveLabelEditor.hidden = !open;
+          liveLabelToggle.hidden = open;
+          liveLabelToggle.setAttribute('aria-expanded', String(open));
+          tail.scrollTop = following ? tail.scrollHeight : offset;
+        }}
         function closeLiveLabel() {{
-          liveLabelEditor.hidden = true;
-          liveLabelToggle.setAttribute('aria-expanded', 'false');
-          liveLabelToggle.focus();
+          setLiveLabelOpen(false);
+          liveLabelToggle.focus({{preventScroll:true}});
         }}
         liveLabelToggle.addEventListener('click', () => {{
           if (!liveLabelEditor.hidden) {{ closeLiveLabel(); return; }}
           liveLabelTime = Date.now() / 1000;
-          liveLabelFeedback.textContent = 'Pinned to the moment you opened this editor.';
-          liveLabelEditor.hidden = false;
-          liveLabelToggle.setAttribute('aria-expanded', 'true');
-          liveLabelInput.focus();
+          liveLabelFeedback.textContent = '# mark at ' + new Date(liveLabelTime * 1000).toLocaleTimeString() + ' · Enter to save · Esc to cancel';
+          setLiveLabelOpen(true);
+          liveLabelInput.focus({{preventScroll:true}});
         }});
         document.getElementById('liveLabelCancel').addEventListener('click', closeLiveLabel);
         liveLabelForm.addEventListener('keydown', e => {{
@@ -478,10 +495,10 @@ def create_app(monitor, cfg):
             const data = await res.json();
             if (!res.ok || !data.ok) throw new Error(data.error || 'Could not save label.');
             liveLabelInput.value = '';
-            liveLabelFeedback.textContent = 'Label saved to the timeline.';
+            liveLabelFeedback.textContent = '# label saved to the timeline';
             liveLabelTime = Date.now() / 1000;
-            liveLabelInput.focus();
-          }} catch (err) {{ liveLabelFeedback.textContent = err.message || 'Could not save label. Please retry.'; }}
+            liveLabelInput.focus({{preventScroll:true}});
+          }} catch (err) {{ liveLabelFeedback.textContent = '# ' + (err.message || 'Could not save label. Please retry.'); }}
           finally {{ save.disabled = false; }}
         }});
         const EXC_MARKERS = {exc_markers_json};

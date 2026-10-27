@@ -274,16 +274,18 @@ are fetched on demand, with a 64K-character preview limit to keep memory and
 network use small on the Zero. Export a single-number range for the full log.
 
 **Labels** are short notes you place along the timeline ("swapped battery",
-"firmware v2 flashed"). Hover between rows, or at either end, to reveal a
-**+**; click it, type your note, and press Enter. Keyboard users can Tab to
+"firmware v2 flashed"). Hover over the leftmost fifth of a separator, or at either end, to reveal a
+**+** at its left edge; click it, type your note, and press Enter. Keyboard users can Tab to
 the insertion controls; touch devices show them without hovering. Cancel
 or Escape closes the editor. The label is pinned to that timeline position,
 so changing status filters only removes the session rows around it. Labels
 can be edited or deleted from their strip. They live in `data/labels.json`,
 and Erase removes them along with the sessions.
 
-On **Live**, use the **+** in the Timeline toolbar group to open a label
-editor without leaving or pausing the monitor. The label is pinned to the
+On **Live**, use the **+** at the bottom-left inside the monitor to open a
+terminal-style `> label` prompt. Press Enter or `[save]` to save, and Escape
+or `[cancel]` to close. The editor shares the terminal surface; it keeps the
+monitor's height and scroll position without leaving or pausing the log. The label is pinned to the
 moment you opened the editor, so you can describe an event while output
 continues. Saving confirms the note inline; it appears in the Sessions
 timeline. Cancel or Escape closes the editor.
