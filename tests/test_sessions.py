@@ -2,6 +2,7 @@ import copy
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import config
@@ -97,6 +98,29 @@ class SessionsTest(unittest.TestCase):
         self.assertEqual(state['boot_count'], 0)
         self.monitor._handle_line(None, self.cfg.BOOT_BANNER_MARKER + '\n')
         self.assertEqual(self.client.get('/api/status').json['boot_count'], 1)
+
+    def test_stop_count_survives_monitor_pause(self):
+        class Serial:
+            def write(self, data): return len(data)
+            def flush(self): pass
+        self.monitor._send_stop_keys(Serial())
+        self.monitor.pause_monitoring()
+        with patch('monitor.time.sleep'):
+            self.monitor._run_one_cycle()
+        state = self.client.get('/api/status').json
+        self.assertFalse(state['halted'])
+        self.assertEqual(state['stop_count'], 1)
+
+    def test_failed_stop_write_is_not_acknowledged(self):
+        class BrokenSerial:
+            def write(self, data): raise OSError('disconnected')
+        self.monitor._stop_armed = True
+        with self.assertLogs('guardian', level='WARNING'):
+            self.monitor._send_stop_keys(BrokenSerial())
+        state = self.client.get('/api/status').json
+        self.assertTrue(state['stop_armed'])
+        self.assertFalse(state['halted'])
+        self.assertEqual(state['stop_count'], 0)
 
     def test_bad_export_input(self):
         for data in [dict(from_id='0'), dict(to_id='-1'), dict(from_id='5', to_id='2'), dict(from_id='1.5'), dict(status='BAD')]:

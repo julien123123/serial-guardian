@@ -128,6 +128,42 @@ class DeployTest(unittest.TestCase):
         self.assertNotIn('/api/stop', self.guardian.actions)
         self.assertNotIn('/api/monitoring/pause', self.guardian.actions)
 
+    def test_stop_response_is_used_even_if_next_poll_has_lost_halted_flag(self):
+        call = self.guardian.call
+        def transient_halt(path, post=False):
+            response = call(path, post)
+            if path == '/api/stop':
+                self.guardian.state['halted'] = False
+            return response
+        self.guardian.call = transient_halt
+        with patch('deploy_remote.subprocess.run'):
+            self.run_deploy()
+        self.assertIn('/api/device/reset', self.guardian.actions)
+
+    def test_already_released_port_does_not_wait_for_device_stop(self):
+        self.guardian.state.update(monitoring=False, connected=False, serial_open=False)
+        def transfer(*args, **kwargs):
+            self.assertEqual(self.guardian.actions, [])
+        with patch('deploy_remote.subprocess.run', side_effect=transfer):
+            self.run_deploy()
+        self.assertEqual(self.guardian.actions, ['/api/monitoring/resume', '/api/device/reset'])
+
+    def test_stop_counter_survives_a_missed_halted_state(self):
+        self.guardian.state.update(stop_armed=True, stop_count=0)
+        status = self.guardian.status
+        calls = 0
+        def delivered_stop():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.guardian.state.update(stop_armed=False, halted=False, stop_count=1)
+            return status()
+        self.guardian.status = delivered_stop
+        with patch('deploy_remote.subprocess.run'):
+            self.run_deploy()
+        self.assertNotIn('/api/stop', self.guardian.actions)
+        self.assertIn('/api/monitoring/pause', self.guardian.actions)
+
     def test_boot_marker_is_required(self):
         self.guardian.no_boot = True
         with patch('deploy_remote.subprocess.run'):

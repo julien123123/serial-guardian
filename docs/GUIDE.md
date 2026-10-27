@@ -200,6 +200,19 @@ resume/reset request; the board may contain a partial set of files. Retry
 before resuming it. A timeout while waiting for wake can leave Stop armed:
 cancel it explicitly in the dashboard if abandoning the deployment. A
 missing boot marker after transfer reports an error without retrying Reset.
+The coordinator uses the Stop response and a Stop counter that survives
+monitor pauses, so closing the serial port cannot erase its acknowledgement.
+Update `monitor.py` on the Pi and restart Guardian to enable that counter.
+The script also recognizes an already-paused monitor with a released port.
+
+Ctrl+C interrupts the coordinator on the Pi as well as the local SSH session.
+An SSH disconnect sends SIGHUP; the coordinator exits and releases its lock,
+without continuing into a later resume/reset. New lock-conflict messages
+include the owning PID. If an older interrupted script is still running,
+inspect it with `ssh pi@guardian.local 'ps -eo pid,etime,args | grep "[s]erial-guardian-deploy"'`
+and terminate only its Python coordinator PID. Do not delete the lock file:
+that does not stop its owner and could allow simultaneous deployments.
+
 Temporary staging folders are cleaned up on exit when SSH is reachable.
 
 ## 5. Run it as a service

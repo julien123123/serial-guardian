@@ -95,6 +95,8 @@ class DeployScriptTest(unittest.TestCase):
         self.assertTrue((self.base/'staged-helper.py').is_file())
         args = json.loads(self.remote.read_text())
         self.assertNotIn('--no-reset', args)
+        remote_ssh = next(row for row in rows if row[0]=='ssh' and 'deploy_remote.py' in row[-1])
+        self.assertIn('-tt', remote_ssh)
         self.assertEqual(args[args.index('--mpremote')+1], 'python3 -m mpremote')
         self.assertEqual(args[-2:], ['/tmp/serial-guardian-deploy.Test1234/a file.mpy', "/tmp/serial-guardian-deploy.Test1234/b'file.mpy"])
         self.assertLess(next(i for i,r in enumerate(rows) if r[0]=='scp'), next(i for i,r in enumerate(rows) if r[0]=='ssh' and 'deploy_remote.py' in r[-1]))

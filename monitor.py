@@ -75,6 +75,7 @@ class SerialSessionMonitor:
 
         self.connected = False
         self.boot_count = 0
+        self.stop_count = 0
         self.live_tail = collections.deque(maxlen=cfg.LIVE_TAIL_LINES)
         self.live_times = collections.deque(maxlen=cfg.LIVE_TAIL_LINES)
         self.live_started = time.time()
@@ -467,7 +468,8 @@ class SerialSessionMonitor:
             ser.write(self.cfg.STOP_BYTES)
             ser.flush()
         except Exception:
-            pass
+            logger.warning("could not send device stop keys", exc_info=True)
+            return
         # This session's exception marker(s), if any (MicroPython prints a
         # KeyboardInterrupt traceback for our own Ctrl-C), are expected --
         # don't treat it as a bug and don't let the auto-reset logic
@@ -478,6 +480,7 @@ class SerialSessionMonitor:
         with self.lock:
             self._stop_armed = False
             self._currently_halted = True
+            self.stop_count += 1
             if self._pause_pending:
                 self._pause_pending = False
                 self._monitoring_on = False
@@ -540,6 +543,7 @@ class SerialSessionMonitor:
                 "serial_open": self._ser is not None,
                 "serial_port": self.cfg.SERIAL_PORT,
                 "boot_count": self.boot_count,
+                "stop_count": self.stop_count,
                 "monitoring": self._monitoring_on,
                 "pause_pending": self._pause_pending,
                 "stats": dict(self.stats),

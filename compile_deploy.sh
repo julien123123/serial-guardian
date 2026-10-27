@@ -205,9 +205,11 @@ import argparse
 import fcntl
 import json
 import math
+import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -260,21 +262,29 @@ def deploy(guardian, files, mpremote, wait=300, boot_wait=30, transfer_wait=120,
     if not required <= state.keys():
         raise DeploymentError('Update and restart Serial Guardian on the Pi first')
     port = state['serial_port']
-    print('Waiting for device wake / Stop to take effect…', flush=True)
-    if not state['monitoring']:
-        guardian.call('/api/monitoring/resume', post=True)
-    # Stop and Pause are toggles. Never blindly retry them.
-    if not state['halted'] and not state['stop_armed']:
-        guardian.call('/api/stop', post=True)
-    queued_pause = state.get('pause_pending', False)
-    wait_for(guardian, lambda s: s['halted'] or (queued_pause and not s['monitoring']
-             and not s['serial_open'] and not s['connected']), wait, 'device Stop')
-    print('Stop sent. Releasing the serial port…', flush=True)
-    state = guardian.status()
-    if state['monitoring'] and not state.get('pause_pending'):
-        guardian.call('/api/monitoring/pause', post=True)
-    wait_for(guardian, lambda s: not s['monitoring'] and not s['serial_open'] and not s['connected'],
-             wait, 'serial port release')
+    def released(s):
+        return not s['monitoring'] and not s['serial_open'] and not s['connected']
+
+    if released(state):
+        # A user may already have stopped the board and paused Guardian.
+        # mpremote's raw-REPL entry will interrupt the board before copying.
+        print('Monitoring already paused; serial port is released.', flush=True)
+    else:
+        print('Waiting for device wake / Stop to take effect…', flush=True)
+        stop_count = state.get('stop_count', 0)
+        if not state['monitoring']:
+            state = guardian.call('/api/monitoring/resume', post=True)
+        # Stop and Pause are toggles. Never blindly retry them. A connected
+        # Stop can complete in this response and disappear before the next GET.
+        if not state['halted'] and not state['stop_armed']:
+            state = guardian.call('/api/stop', post=True)
+        if not state['halted'] and not released(state) and state.get('stop_count', 0) <= stop_count:
+            state = wait_for(guardian, lambda s: s['halted'] or released(s)
+                             or s.get('stop_count', 0) > stop_count, wait, 'device Stop')
+        print('Stop acknowledged. Releasing the serial port…', flush=True)
+        if state['monitoring'] and not state.get('pause_pending'):
+            guardian.call('/api/monitoring/pause', post=True)
+        wait_for(guardian, released, wait, 'serial port release')
     print('Serial port released. Transferring {} file(s)…'.format(len(files)), flush=True)
     # A single mpremote connection, explicit port, no implicit soft reboot.
     # A partial/failed transfer raises before any resume or reset request.
@@ -306,14 +316,28 @@ def main():
     args = parser.parse_args()
     if any(not math.isfinite(value) or value <= 0 for value in (args.wait, args.boot_wait, args.transfer_wait)):
         parser.error('timeouts must be positive')
+    def cancel(signum, frame):
+        raise KeyboardInterrupt
+
+    # The SSH session has a PTY: Ctrl+C interrupts us, and disconnection sends
+    # SIGHUP. Both unwind subprocess.run and this lock instead of orphaning us.
+    signal.signal(signal.SIGHUP, cancel)
+    signal.signal(signal.SIGTERM, cancel)
     # Serialize cooperating deploy invocations on this Pi, including different
     # staging directories. The advisory lock is released on every exit path.
-    with open('/tmp/serial-guardian-deploy.lock', 'a') as lock:
+    with open('/tmp/serial-guardian-deploy.lock', 'a+') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print('Another deployment is running on this Pi.', file=sys.stderr)
+            lock.seek(0)
+            owner = lock.read().strip() or 'unknown (older coordinator)'
+            print('Another deployment is running on this Pi. Lock owner: {}. '
+                  'Inspect its process before cancelling it; do not delete the lock file.'.format(owner), file=sys.stderr)
             return 1
+        lock.seek(0)
+        lock.truncate()
+        lock.write('PID ' + str(os.getpid()))
+        lock.flush()
         try:
             deploy(Guardian(args.url), args.files, args.mpremote,
                    args.wait, args.boot_wait, args.transfer_wait, reset=not args.no_reset)
@@ -353,7 +377,8 @@ deploy_files() (
     remote_command="$(quote_command python3 "$stage/deploy_remote.py" --url "$GUARDIAN_URL" \
         --mpremote "$MPREMOTE" --wait "$DEPLOY_WAIT" --boot-wait "$BOOT_WAIT" \
         --transfer-wait "$TRANSFER_WAIT" "${reset_args[@]}" -- "${remote_files[@]}")"
-    ssh -- "$SSH_TARGET" "$remote_command"
+    # A remote PTY forwards Ctrl+C and sends SIGHUP if SSH disconnects.
+    ssh -tt -- "$SSH_TARGET" "$remote_command"
 )
 
 # ---------- main menu --------------------------------------------------------
