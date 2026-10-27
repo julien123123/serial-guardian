@@ -21,7 +21,7 @@ FIELD_SPECS = [
     ("BAUD", "int", "Baud rate",
      "Serial baud rate. Takes effect on the next (re)connect."),
     ("SERIAL_READ_TIMEOUT", "float", "Read timeout (s)",
-     "How long to block waiting for at least one byte when idle. Takes effect on the next (re)connect."),
+     "Maximum idle read wait; control and recovery checks wake at least every 0.1 s. Available bytes are read immediately."),
     ("GOTOSLEEP_MARKER", "str", "Clean-shutdown marker",
      "A session containing this text before it disconnects is tagged NORMAL."),
     ("BOOT_BANNER_MARKER", "str", "Boot banner marker",

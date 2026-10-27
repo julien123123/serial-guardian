@@ -87,7 +87,7 @@ exception-recovery path, never for the manual Stop/Resume buttons.
 sudo apt update
 sudo apt install -y python3-serial python3-flask python3-waitress git
 mkdir -p /home/pi/serial-guardian
-# copy config.py, monitor.py, webapp.py, fields.py, labels.py, exporter.py,
+# copy config.py, monitor.py, serial_capture.py, webapp.py, fields.py, labels.py, exporter.py,
 # settings.py, applog.py, sdnotify.py, watchdog.py, run.py, systemd/ here
 #   e.g. scp -r ./pi-serial-guardian/* pi@guardian.local:~/serial-guardian/
 ```
@@ -554,3 +554,22 @@ ever want proper querying (e.g. "all EXCEPTIONs in the last 30 days"),
 swapping `index.jsonl` for a small SQLite table is the natural next step —
 not done here to keep the dependency list to `pyserial` + `Flask`
 (+ `waitress`).
+
+## Brief connections and capture diagnostics
+
+Guardian uses Linux device-arrival notifications to open short-lived serial
+ports promptly, preserves queued startup input, and keeps a final line even
+without a newline. Keep `serial_capture.py` alongside `monitor.py` when
+updating the Pi, then restart the service. No new Python package is required. Even with a long configured read timeout,
+control/recovery checks wake at least every 100 ms; increasing the timeout does
+not delay reading bytes that are already available. New JSON exports include
+the matched `exception_marker` so future classifications can be traced.
+
+`GET /api/status` reports `serial_connections`, `serial_bytes_received`,
+`empty_sessions`, and `last_serial_open_error` since the process started.
+An empty session means the port opened but no text was captured; it does
+not prove that the board transmitted text over USB. Bytes printed before USB
+is ready or lost during board shutdown cannot be reconstructed on the host.
+
+See [the backend review](BACKEND_REVIEW.md) for capture tests, benchmark
+results, remaining storage/regex costs, and the limits of simulated devices.

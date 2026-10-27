@@ -11,8 +11,8 @@ fresh install starts with.
 SERIAL_PORT = "/dev/ttyACM0"
 BAUD = 115200
 # How long ser.read() blocks waiting for at least one byte when the board
-# is idle. Kept short so the boot-timeout / stop-request checks (which run
-# once per loop iteration) stay responsive.
+# is idle. Available bytes are always read immediately. The capture loop
+# caps each wait to 0.1 s so control/recovery timers stay responsive.
 SERIAL_READ_TIMEOUT = 0.3
 
 # --- Where everything gets stored on the Pi's SD card ------------------------

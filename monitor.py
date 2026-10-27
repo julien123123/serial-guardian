@@ -31,14 +31,12 @@ disappear from the Live page's counters.
 
 Read loop notes
 ----------------
-pyserial's Serial.readline() reads one byte per syscall (it's the default
-io.RawIOBase behaviour). That's fine on a fast laptop but on a single-core
-Pi Zero W it can't always keep up with bursty output (a traceback, or the
-~50 NMEA lines a GPS sync dumps in under a second) -- Python falls behind,
-the kernel's USB CDC buffer fills up, and lines get dropped. The loop below
-blocks for the first byte (so it still sleeps properly when idle) and then
-drains everything else currently buffered in one read() call, which turns
-"one syscall per byte" into "about one syscall per burst".
+Linux device-arrival notifications wake capture immediately when the serial
+node appears. CaptureSerial preserves queued startup input that pyserial
+normally flushes during open. A select + single OS read drains each burst
+without an in_waiting ioctl or a multi-read that can throw away partial
+results on disconnect. Lines are split in one pass, and an unterminated
+final line is retained when the device sleeps. See serial_capture.py.
 
 Reliability notes
 ------------------
@@ -64,6 +62,7 @@ import threading
 import time
 
 import serial
+from serial_capture import CaptureSerial, read_chunk, wait_for_port
 
 logger = logging.getLogger("guardian")
 
@@ -76,6 +75,10 @@ class SerialSessionMonitor:
         self.connected = False
         self.boot_count = 0
         self.stop_count = 0
+        self.serial_connections = 0
+        self.serial_bytes_received = 0
+        self.empty_sessions = 0
+        self.last_serial_open_error = None
         self.live_tail = collections.deque(maxlen=cfg.LIVE_TAIL_LINES)
         self.live_times = collections.deque(maxlen=cfg.LIVE_TAIL_LINES)
         self.live_started = time.time()
@@ -145,6 +148,7 @@ class SerialSessionMonitor:
         self._lines = []
         self._start_ts = None
         self._is_exception = False
+        self._exception_marker = None
         self._user_stopped = False     # this session's halt was OUR Ctrl-C, not a real bug
         self._pending_soft_reset_at = None
         self._awaiting_boot = False
@@ -193,38 +197,55 @@ class SerialSessionMonitor:
             time.sleep(cfg.MONITORING_PAUSE_POLL_INTERVAL)
             return
 
+        if not wait_for_port(cfg.SERIAL_PORT):
+            return
+        buf = b""
+        ser = None
         try:
-            with serial.Serial(cfg.SERIAL_PORT, cfg.BAUD,
+            with CaptureSerial(cfg.SERIAL_PORT, cfg.BAUD,
                                 timeout=cfg.SERIAL_READ_TIMEOUT) as ser:
                 with self.lock:
                     self.connected = True
                     self._ser = ser
+                    self.serial_connections += 1
+                    self.last_serial_open_error = None
                 self._begin_session()
                 self._send_armed_stop_if_any(ser)
 
-                buf = b""
                 # Exits (closing the port via the `with` above) either
                 # on a real disconnect (caught below) or because
                 # monitoring got paused mid-session.
                 while self._monitoring_enabled():
                     self._last_alive = time.time()
-                    n = ser.in_waiting
-                    chunk = ser.read(n if n else 1)   # blocks up to timeout when idle
+                    chunk = read_chunk(ser, min(cfg.SERIAL_READ_TIMEOUT, 0.1))
                     if chunk:
-                        buf += chunk
-                        while b"\n" in buf:
-                            raw, buf = buf.split(b"\n", 1)
-                            self._handle_line(ser, raw.decode(errors="ignore") + "\n")
-                    self._check_boot_timeout()
-        except serial.SerialException:
-            pass  # board went to sleep / disconnected -- handled below either way
+                        with self.lock:
+                            self.serial_bytes_received += len(chunk)
+                        parts = (buf + chunk).split(b"\n")
+                        buf = parts.pop()
+                        for raw in parts:
+                            self._handle_line(ser, raw.decode(errors="replace") + "\n")
+                    self._check_boot_timeout(ser)
+        except serial.SerialException as exc:
+            if ser is None:
+                with self.lock:
+                    self.last_serial_open_error = str(exc)
+            # A read failure after a successful open usually means sleep/USB removal.
+        finally:
+            # Devices may sleep without a final newline. Preserve that text,
+            # including a clean-shutdown marker at the end of a short burst.
+            if buf:
+                self._handle_line(ser, buf.decode(errors="replace"))
 
         with self.lock:
             self.connected = False
             self._ser = None
             self._currently_halted = False   # can't stay "halted" through a disconnect
         self._finish_session()
-        time.sleep(0.2)
+        # Briefly back off if udev has not removed the old node yet. Device
+        # creation after removal is handled by inotify on the next cycle.
+        if os.path.exists(cfg.SERIAL_PORT):
+            time.sleep(0.02)
 
     # ------------------------------------------------------------------ #
     # session lifecycle
@@ -272,6 +293,7 @@ class SerialSessionMonitor:
             for marker in self.cfg.EXCEPTION_MARKERS:
                 if marker in line:
                     self._is_exception = True
+                    self._exception_marker = marker
                     self._pending_soft_reset_at = now + self.cfg.SOFT_RESET_DELAY
                     break
 
@@ -298,6 +320,8 @@ class SerialSessionMonitor:
             self.next_id += 1
             self.last_session_id = sid
             self.stats[status] += 1
+            if not self._lines:
+                self.empty_sessions += 1
 
         fname = f"{sid:06d}_{status}.log"
         path = os.path.join(self.sessions_dir, fname)
@@ -314,6 +338,7 @@ class SerialSessionMonitor:
             "duration": round(duration, 3),
             "lines": len(self._lines),
             "file": fname,
+            "exception_marker": self._exception_marker,
         }
         with open(self.index_path, "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -358,7 +383,12 @@ class SerialSessionMonitor:
         self._awaiting_boot = True
         self._boot_deadline = time.time() + self.cfg.BOOT_TIMEOUT
 
-    def _check_boot_timeout(self):
+    def _check_boot_timeout(self, ser=None):
+        # Recovery must run even if an exception is the board's final line.
+        # The read loop wakes at least every 100 ms, independently of a long
+        # user-configured read timeout.
+        if ser is not None and self._pending_soft_reset_at and time.time() >= self._pending_soft_reset_at:
+            self._trigger_soft_reset(ser)
         if self._awaiting_boot and time.time() > self._boot_deadline:
             self._awaiting_boot = False
             self._hard_reset()
@@ -544,6 +574,10 @@ class SerialSessionMonitor:
                 "serial_port": self.cfg.SERIAL_PORT,
                 "boot_count": self.boot_count,
                 "stop_count": self.stop_count,
+                "serial_connections": self.serial_connections,
+                "serial_bytes_received": self.serial_bytes_received,
+                "empty_sessions": self.empty_sessions,
+                "last_serial_open_error": self.last_serial_open_error,
                 "monitoring": self._monitoring_on,
                 "pause_pending": self._pause_pending,
                 "stats": dict(self.stats),
@@ -592,7 +626,7 @@ class SerialSessionMonitor:
             lines = out.stdout.splitlines()
         except Exception:
             with open(self.index_path) as f:
-                lines = f.readlines()[-count:]
+                lines = list(collections.deque(f, maxlen=count))
 
         records = [json.loads(l) for l in lines if l.strip()]
         floor = records[0]["start"] if records and len(lines) >= count else 0.0
@@ -634,11 +668,16 @@ class SerialSessionMonitor:
         return None
 
     def read_session_text(self, sid, max_chars=None):
-        matches = glob.glob(os.path.join(self.sessions_dir, f"{sid:06d}_*.log"))
-        if not matches:
-            return None
-        with open(matches[0]) as f:
-            return f.read(max_chars) if max_chars is not None else f.read()
+        # Four direct paths instead of globbing every file in sessions/ for
+        # every row/export entry. Log retention may leave many exception logs.
+        for status in ("NORMAL", "ANOMALY", "EXCEPTION", "STOPPED"):
+            path = os.path.join(self.sessions_dir, f"{sid:06d}_{status}.log")
+            try:
+                with open(path) as f:
+                    return f.read(max_chars) if max_chars is not None else f.read()
+            except FileNotFoundError:
+                continue
+        return None
 
     # ------------------------------------------------------------------ #
     # erase all history -- called from a Flask request thread

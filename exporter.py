@@ -76,6 +76,8 @@ def build(monitor, cfg, fmt="json", with_labels=True, with_logs=True,
             "lines": rec["lines"],
             "fields": fields.extract(text, extractors),
         }
+        if "exception_marker" in rec:
+            e["exception_marker"] = rec["exception_marker"]
         if with_logs:
             e["log"] = text
         return e, text

@@ -34,8 +34,12 @@ class MenuKeyboardTest(unittest.TestCase):
                     preexec_fn=setup, env=dict(os.environ, TERM='xterm-256color'))
                 os.close(slave)
                 try:
-                    self.assertTrue(select.select([master], [], [], 5)[0], 'menu did not render')
-                    os.read(master, 65536)
+                    rendered = bytearray()
+                    deadline = time.monotonic()+5
+                    while b'Reset [x]' not in rendered and time.monotonic() < deadline:
+                        if select.select([master], [], [], .05)[0]:
+                            rendered.extend(os.read(master, 65536))
+                    self.assertIn(b'Reset [x]', rendered, 'menu did not finish rendering')
                     os.write(master, key)  # Numeric cases deliberately omit Enter.
                     deadline = time.monotonic()+5
                     while process.poll() is None and time.monotonic() < deadline:
@@ -86,7 +90,7 @@ class FullScriptMenuTest(unittest.TestCase):
                                 except OSError: break
                             if text in output[start:]: return
                         self.fail('Did not reach '+repr(text)+'; output='+repr(output[-1000:]))
-                    wait_text(b'Compile all and deploy')
+                    wait_text(b'[x] Reset device after transfer')
                     os.write(master, choice)  # No Enter.
                     if choice == b'6':
                         wait_text(b'[ ] Reset device after transfer')
