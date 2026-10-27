@@ -140,10 +140,63 @@ for the configuration again because its default project-relative paths may
 have changed. To change any value without moving the script, choose
 **Settings** from the menu.
 
-Choose **Compile all .py files** to build everything, or **Deploy selected
-files** to choose one or more existing `.mpy` files. **Compile all, then
-deploy selected files** combines both operations. Selected files are copied
-to the Pi with `scp` and then installed through `mpremote`.
+Keep `deploy_remote.py` beside `compile_deploy.sh` on the development
+computer. It is staged temporarily on the Pi for each deployment. Python 3,
+`mpremote`, and a running, updated Guardian are required on the Pi. Restart
+Guardian after updating `monitor.py` and `webapp.py`; deployments use the
+new lightweight `/api/status` endpoint. No compiler is installed on the Pi.
+
+The first menu item is **Compile all and deploy selected files**. Press a
+number from 1 to 5 to choose an action immediately, without Enter. Option 2
+deploys existing compiled files; option 3 compiles without deploying. Run
+`./compile_deploy.sh` in an interactive terminal, including PyCharm's built-in
+terminal, since file selection and settings use `whiptail` dialogs.
+
+Every file checklist starts empty; file choices are not remembered.
+After choosing modules, **Deployment options** contains one checkbox:
+**Reset device after transfer**, checked by default. Uncheck it with Space
+to keep the device stopped at its REPL after uploading. Escape cancels the
+deployment before the device is touched.
+
+The coordinated deployment performs these steps:
+
+1. Compile locally for option 1. A compilation error retains the previous
+   build and does not touch the board.
+2. Copy the modules and coordinator into a unique temporary folder on the Pi.
+3. Arm Stop if needed and wait for it to take effect on the next wake.
+4. Pause monitoring and wait until the serial connection has actually closed.
+5. Copy all selected files through one `mpremote` connection, using Guardian's
+   configured serial port and `resume` to prevent an implicit soft reset.
+6. Restore monitoring and wait for its serial connection.
+7. If Reset was selected, request Reset through Guardian so the dashboard
+   captures startup, then wait for `BOOT_BANNER_MARKER`. Otherwise, leave the
+   board at its REPL and use Reset in Guardian whenever you are ready.
+
+"Boot detected" confirms that marker, not the health of every part of the
+application. Keep Live open to watch output. Avoid changing device or monitor
+controls during deployment. Only one cooperating coordinator can run on the
+Pi at a time. Old remembered-selection settings are ignored; there is no
+repeat-deployment command.
+
+The remote `mpremote` setting is an executable with optional arguments, such
+as `/home/pi/venv/bin/mpremote` or `python3 -m mpremote`, not a shell snippet.
+Guardian is contacted from the Pi at `http://127.0.0.1:8080` by default;
+change this in **Settings** if its port/address differs.
+
+The default wake/reconnect timeout is 300 seconds, the boot-marker timeout
+is 30 seconds, and the transfer timeout is 120 seconds. Override these for
+long sleep cycles or large transfers:
+
+```bash
+GUARDIAN_DEPLOY_WAIT=900 GUARDIAN_BOOT_WAIT=60 GUARDIAN_TRANSFER_WAIT=180 ./compile_deploy.sh
+```
+
+A failed or timed-out transfer leaves monitoring paused and makes no
+resume/reset request; the board may contain a partial set of files. Retry
+before resuming it. A timeout while waiting for wake can leave Stop armed:
+cancel it explicitly in the dashboard if abandoning the deployment. A
+missing boot marker after transfer reports an error without retrying Reset.
+Temporary staging folders are cleaned up on exit when SSH is reachable.
 
 ## 5. Run it as a service
 
@@ -282,13 +335,20 @@ so changing status filters only removes the session rows around it. Labels
 can be edited or deleted from their strip. They live in `data/labels.json`,
 and Erase removes them along with the sessions.
 
-On **Live**, use the **+** at the bottom-left inside the monitor to open a
-terminal-style `> label` prompt. Press Enter or `[save]` to save, and Escape
-or `[cancel]` to close. The editor shares the terminal surface; it keeps the
-monitor's height and scroll position without leaving or pausing the log. The label is pinned to the
-moment you opened the editor, so you can describe an event while output
-continues. Saving confirms the note inline; it appears in the Sessions
-timeline. Cancel or Escape closes the editor.
+On **Live**, a larger **+** follows the last line inside the scrolling monitor.
+It appears when the pointer is inside the monitor; keyboard focus and touch
+also reveal it.
+It opens a terminal-style `> label` prompt directly in the stream. Press
+Enter or `[save]` to insert the label at the current time, and Escape or
+`[cancel]` to close. Saved labels appear between log lines in that same
+stream and remain there when you reload the page. New output continues
+under them. The prompt, labels, and output share one scrolling document;
+the editor is never pinned to the bottom of the monitor window.
+
+Live output and its timestamps are a bounded in-memory buffer, so restarting
+the service starts a fresh live stream. Labels remain saved in Sessions.
+Labels edited or deleted from Sessions update in the live stream on the
+next poll. The combined live stream uses the configured live-tail limit.
 
 **Export** is the arrow-to-tray icon at the right of the session filters
 (hover for its name). Click it to unroll the full-width export settings.
@@ -301,7 +361,10 @@ otherwise they open the inline log. Closing the panel or switching modes
 hides the highlights but remembers the selection until you leave the page.
 There are no row-selection checkboxes. The active status filter applies in
 all three modes: Anomaly exports only ANOMALY sessions. JSON and plain text
-are available, with optional labels and raw log text. When a filter,
+are available, with optional labels and raw log text. **Export** downloads
+the file. **Raw file** opens its unrendered contents in a new browser tab
+without downloading; both actions use the same format, filter, selection,
+range, and inclusion options. When a filter,
 selection, or number range is active, only labels within the matching
 sessions' time span are included.
 Pruned NORMAL sessions export as metadata only. Plain-text exports print

@@ -59,10 +59,63 @@ class SessionsTest(unittest.TestCase):
         self.assertIn('Battery changed live', self.client.get('/sessions').text)
         self.assertIn('Battery changed live', self.client.get('/sessions?status=ANOMALY').text)
 
+    def test_live_stream_interleaves_labels_and_tracks_changes(self):
+        self.monitor._handle_line(None, 'before label\n')
+        response = self.client.post('/api/labels', json=dict(text='<b>new label</b>'))
+        lid = response.json['label']['id']
+        self.monitor._handle_line(None, 'after label\n')
+        stream = self.client.get('/api/tail?stream=1').json['stream']
+        self.assertEqual([item['type'] for item in stream], ['log', 'label', 'log'])
+        self.assertEqual([item['text'] for item in stream], ['before label', '<b>new label</b>', 'after label'])
+        self.assertEqual(self.client.get('/api/tail').json['tail'], ['before label', 'after label'])
+        self.client.post(f'/api/labels/{lid}', json=dict(text='edited label'))
+        self.assertEqual(self.client.get('/api/tail?stream=1').json['stream'][1]['text'], 'edited label')
+        self.client.post(f'/api/labels/{lid}/delete')
+        self.assertEqual([item['type'] for item in self.client.get('/api/tail?stream=1').json['stream']], ['log', 'log'])
+
+    def test_label_before_first_serial_line_stays_in_stream(self):
+        self.client.post('/api/labels', json=dict(text='before connection'))
+        self.assertEqual([item['text'] for item in self.client.get('/api/tail?stream=1').json['stream']], ['before connection'])
+        self.monitor._handle_line(None, 'first output\n')
+        self.assertEqual([item['text'] for item in self.client.get('/api/tail?stream=1').json['stream']], ['before connection', 'first output'])
+
+    def test_live_stream_is_bounded_and_resizes_with_tail(self):
+        self.monitor._handle_line(None, 'old\n')
+        self.client.post('/api/labels', json=dict(text='mark'))
+        self.monitor._handle_line(None, 'new\n')
+        self.cfg.LIVE_TAIL_LINES = 2
+        self.monitor.resize_live_tail()
+        self.assertEqual([item['text'] for item in self.client.get('/api/tail?stream=1').json['stream']], ['mark', 'new'])
+        self.monitor._handle_line(None, 'newer\n')
+        self.assertEqual([item['text'] for item in self.client.get('/api/tail?stream=1').json['stream']], ['new', 'newer'])
+        self.assertEqual(len(self.monitor.live_times), 2)
+
+    def test_deployment_status_reports_port_and_boot_events(self):
+        state = self.client.get('/api/status').json
+        self.assertEqual(state['serial_port'], self.cfg.SERIAL_PORT)
+        self.assertFalse(state['serial_open'])
+        self.assertEqual(state['boot_count'], 0)
+        self.monitor._handle_line(None, self.cfg.BOOT_BANNER_MARKER + '\n')
+        self.assertEqual(self.client.get('/api/status').json['boot_count'], 1)
+
     def test_bad_export_input(self):
         for data in [dict(from_id='0'), dict(to_id='-1'), dict(from_id='5', to_id='2'), dict(from_id='1.5'), dict(status='BAD')]:
             with self.subTest(data=data):
                 self.assertEqual(self.client.post('/export', data=data).status_code, 400)
+
+    def test_raw_export_is_inline_text_and_uses_same_selection(self):
+        args = dict(scope='selected', status='ANOMALY', ids=['1', '2', '4'], delivery='raw')
+        raw = self.client.post('/export', data=args)
+        self.assertEqual(raw.status_code, 200)
+        self.assertTrue(raw.headers['Content-Disposition'].startswith('inline;'))
+        self.assertEqual(raw.mimetype, 'text/plain')
+        self.assertEqual(raw.headers['X-Content-Type-Options'], 'nosniff')
+        self.assertEqual([r['id'] for r in json.loads(raw.data)['sessions']], [2, 4])
+        text = self.client.post('/export', data=dict(scope='range', from_id='2', to_id='2', format='txt', delivery='raw'))
+        self.assertIn(b'==== #2 ANOMALY', text.data)
+        download = self.client.post('/export', data=dict(delivery='download'))
+        self.assertTrue(download.headers['Content-Disposition'].startswith('attachment;'))
+        self.assertEqual(download.mimetype, 'application/json')
 
     def test_pruned_and_text_export(self):
         (Path(self.monitor.sessions_dir) / self.records[1]['file']).unlink()

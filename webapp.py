@@ -243,7 +243,7 @@ BASE = """
      they sit in the same place in the log whatever filter is active. */
   /* Let the last separator's control extend below its border without
      changing the spacing to the hint below the table. */
-  .session-table { overflow-x:auto; padding-bottom:7px; margin-bottom:-7px; }
+  .session-table { overflow-x:auto; padding-bottom:11px; margin-bottom:-11px; }
   .session-tools { display:flex; align-items:flex-start; gap:0.75rem; margin-bottom:0.75rem; }
   .session-tools .filters { flex:1; flex-wrap:wrap; margin:0; }
   .export-control { margin-left:auto; flex:none; }
@@ -263,12 +263,18 @@ BASE = """
   .session-table.selecting .session-row:hover td { background:rgba(91,201,201,0.05); }
   .session-table.selecting .session-row.is-selected td { background:rgba(91,201,201,0.12); }
   .session-table.selecting .session-row.is-selected td:first-child { color:var(--cyan); }
-  .monitor-screen { height:55vh; display:flex; flex-direction:column; background:#0a0c0d; }
-  .monitor-screen pre.term { flex:1; min-height:0; height:auto; }
+  .monitor-screen { height:55vh; overflow-y:auto; background:#0a0c0d; }
+  .monitor-screen pre.term { height:auto; overflow:visible; padding-bottom:0; }
+  .monitor-screen pre.term:empty { display:none; }
+  .monitor-screen pre.term:empty + .terminal-label-line { padding-top:0.9rem; }
+  .live-stream-label { color:var(--ink-dim); }
   .terminal-label-line { padding:0 1rem 0.7rem; }
   .terminal-key { font:inherit; color:var(--ink-dim); border:0; padding:0;
     background:none; cursor:pointer; }
   .terminal-key:hover { color:var(--ink); }
+  #liveLabelToggle { font-size:22px; line-height:22px; width:2ch; text-align:left; opacity:0; }
+  .monitor-screen:hover #liveLabelToggle, #liveLabelToggle:focus-visible { opacity:1; }
+  @media (hover:none) { #liveLabelToggle { opacity:1; } }
   .terminal-label-form { display:flex; align-items:baseline; gap:1ch; flex-wrap:wrap; margin:0; }
   .terminal-label-form .prompt { color:var(--ink-dim); white-space:nowrap; }
   .terminal-label-form input { flex:1; min-width:10ch; width:0; padding:0;
@@ -290,9 +296,9 @@ BASE = """
   tr.label-gap td { padding:0; height:0; border:0; line-height:0; }
   .label-gap-anchor { position:relative; height:0; }
   .label-insert {
-    position:absolute; top:-7px; left:0; width:20%; height:14px; padding:0;
+    position:absolute; top:-11px; left:0; width:20%; height:22px; padding:0;
     background:none; border:0; color:var(--ink-dim); cursor:pointer; opacity:0;
-    font:inherit; font-size:14px; line-height:14px; text-align:left; z-index:1;
+    font:inherit; font-size:22px; line-height:22px; text-align:left; z-index:1;
   }
   .label-insert span { display:block; width:2ch; background:var(--bg); }
   .label-insert:hover, .label-insert:focus-visible { opacity:1; }
@@ -460,9 +466,10 @@ def create_app(monitor, cfg):
         const liveLabelForm = document.getElementById('liveLabelForm');
         const liveLabelInput = document.getElementById('liveLabelText');
         const liveLabelFeedback = document.getElementById('liveLabelFeedback');
-        let liveLabelTime = null;
+        let streamItems = [];
+        let streamRequest = 0;
         function setLiveLabelOpen(open) {{
-          const tail = document.getElementById('tail');
+          const tail = document.querySelector('.monitor-screen');
           const following = tail.scrollTop + tail.clientHeight >= tail.scrollHeight - 20;
           const offset = tail.scrollTop;
           liveLabelEditor.hidden = !open;
@@ -476,8 +483,7 @@ def create_app(monitor, cfg):
         }}
         liveLabelToggle.addEventListener('click', () => {{
           if (!liveLabelEditor.hidden) {{ closeLiveLabel(); return; }}
-          liveLabelTime = Date.now() / 1000;
-          liveLabelFeedback.textContent = '# mark at ' + new Date(liveLabelTime * 1000).toLocaleTimeString() + ' · Enter to save · Esc to cancel';
+          liveLabelFeedback.textContent = '# Enter to save · Esc to cancel';
           setLiveLabelOpen(true);
           liveLabelInput.focus({{preventScroll:true}});
         }});
@@ -491,13 +497,14 @@ def create_app(monitor, cfg):
           save.disabled = true;
           try {{
             const res = await fetch('/api/labels', {{method:'POST', headers:{{'Content-Type':'application/json'}},
-              body:JSON.stringify({{text:liveLabelInput.value, ts:liveLabelTime}})}});
+              body:JSON.stringify({{text:liveLabelInput.value}})}});
             const data = await res.json();
             if (!res.ok || !data.ok) throw new Error(data.error || 'Could not save label.');
             liveLabelInput.value = '';
-            liveLabelFeedback.textContent = '# label saved to the timeline';
-            liveLabelTime = Date.now() / 1000;
-            liveLabelInput.focus({{preventScroll:true}});
+            ++streamRequest; // Ignore any poll that began before the save.
+            renderStream([...streamItems, {{...data.label, type:'label'}}].sort((a,b) => a.ts-b.ts));
+            closeLiveLabel();
+            refreshStream().catch(() => {{ /* next poll retries */ }});
           }} catch (err) {{ liveLabelFeedback.textContent = '# ' + (err.message || 'Could not save label. Please retry.'); }}
           finally {{ save.disabled = false; }}
         }});
@@ -594,16 +601,30 @@ def create_app(monitor, cfg):
           await fetch('/api/sessions/erase', {{method:'POST'}});
         }}
 
+        function renderStream(items) {{
+          const box = document.querySelector('.monitor-screen');
+          const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+          const offset = box.scrollTop;
+          streamItems = items;
+          document.getElementById('tail').innerHTML = items.map(item => {{
+            if (item.type !== 'label') return fmt(item.text);
+            const text = item.text.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+            return '<span class="live-stream-label"># label · ' + text + '</span>';
+          }}).join('\\n');
+          box.scrollTop = atBottom ? box.scrollHeight : offset;
+        }}
+        async function refreshStream() {{
+          const requestId = ++streamRequest;
+          const res = await fetch('/api/tail?stream=1');
+          if (!res.ok) throw new Error('Monitor unavailable');
+          const data = await res.json();
+          if (requestId !== streamRequest) return;
+          renderStream(data.stream);
+          applyStatus(data.status);
+        }}
         async function poll() {{
-          try {{
-            const res = await fetch('/api/tail');
-            const data = await res.json();
-            const box = document.getElementById('tail');
-            const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
-            box.innerHTML = data.tail.map(fmt).join('\\n');
-            if (atBottom) box.scrollTop = box.scrollHeight;
-            applyStatus(data.status);
-          }} catch (e) {{ /* pi rebooting, wifi hiccup, etc -- just retry */ }}
+          try {{ await refreshStream(); }}
+          catch (e) {{ /* pi rebooting, wifi hiccup, etc -- just retry */ }}
           setTimeout(poll, 1500);
         }}
         poll();
@@ -613,7 +634,21 @@ def create_app(monitor, cfg):
 
     @app.route("/api/tail")
     def api_tail():
-        return jsonify({"tail": monitor.get_tail(), "status": monitor.get_status()})
+        result = {"status": monitor.get_status()}
+        if request.args.get("stream") == "1":
+            stream = monitor.get_timed_tail()
+            # Before the log buffer fills, retain labels placed before the
+            # first serial line as well as those between lines.
+            floor = stream[0]["ts"] if stream and len(stream) >= max(1, cfg.LIVE_TAIL_LINES) else monitor.live_started
+            stream.extend(dict(label, type="label") for label in labels.load(cfg) if label["ts"] >= floor)
+            result["stream"] = sorted(stream, key=lambda item: item["ts"])[-max(1, cfg.LIVE_TAIL_LINES):]
+        else:
+            result["tail"] = monitor.get_tail()
+        return jsonify(result)
+
+    @app.route("/api/status")
+    def api_status():
+        return jsonify(monitor.get_status())
 
     @app.route("/api/stop", methods=["POST"])
     def api_stop():
@@ -768,7 +803,7 @@ def create_app(monitor, cfg):
           </details>
         </div>
         <div class="panel export-panel" id="exportOptions" hidden>
-          <form id="exportForm" method="post" action="/export">
+          <form id="exportForm" method="post" action="/export" rel="noopener">
             <input type="hidden" name="status" value="{status or ''}">
             <fieldset class="export-scopes">
               <legend class="hint">{filter_name} sessions</legend>
@@ -787,7 +822,8 @@ def create_app(monitor, cfg):
               <label><input type="checkbox" name="include_labels" value="1" checked> Include labels</label>
               <input type="hidden" name="include_logs" value="0">
               <label><input type="checkbox" name="include_logs" value="1" checked> Include raw log text</label>
-              <button class="btn" type="submit">Export</button>
+              <button class="btn" type="submit" name="delivery" value="download">Export</button>
+              <button class="btn" type="submit" name="delivery" value="raw" formtarget="_blank">Raw file</button>
             </div>
             <p class="hint">The status filter applies in every mode. Pruned logs export as metadata only.</p>
           </form>
@@ -1016,8 +1052,10 @@ def create_app(monitor, cfg):
             monitor, cfg, status=status, ids=ids, from_id=lo, to_id=hi, fmt=fmt,
             with_labels=flag("include_labels"), with_logs=flag("include_logs"),
         )
-        return Response(gen, mimetype=mimetype, headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+        raw = request.form.get("delivery") == "raw"
+        return Response(gen, content_type="text/plain; charset=utf-8" if raw else mimetype, headers={
+            "Content-Disposition": f'{"inline" if raw else "attachment"}; filename="{filename}"',
+            "X-Content-Type-Options": "nosniff",
         })
 
     @app.route("/api/sessions/<int:sid>/log")

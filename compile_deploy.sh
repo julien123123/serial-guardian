@@ -8,7 +8,7 @@ set -euo pipefail
 #   1. Configure paths and targets on first run (or after moving this script)
 #   2. Choose whether to compile all .py files first
 #   3. Select the files to deploy
-#   4. Upload selected files and run mpremote remotely
+#   4. Stage, stop/release, transfer, restore monitoring; optionally reset
 #
 # Dependencies:
 #   - whiptail
@@ -50,6 +50,11 @@ yes_no() {
 
 # ---------- dependency checks -----------------------------------------------
 
+case "${1:-}" in
+    "") ;;
+    --help|-h) echo "Usage: $0"; exit 0 ;;
+    *) die "Usage: $0 (choose files interactively for every deployment)" ;;
+esac
 require_cmd whiptail
 require_cmd ssh
 require_cmd scp
@@ -69,9 +74,15 @@ MPREMOTE_DEFAULT="mpremote"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/serial-guardian"
 CONFIG_FILE="$CONFIG_DIR/compile_deploy.conf"
 CURRENT_SCRIPT_DIR="$SCRIPT_DIR"
+GUARDIAN_URL="http://127.0.0.1:8080"
+DEPLOY_WAIT="${GUARDIAN_DEPLOY_WAIT:-300}"
+BOOT_WAIT="${GUARDIAN_BOOT_WAIT:-30}"
+TRANSFER_WAIT="${GUARDIAN_TRANSFER_WAIT:-120}"
 
 save_config() {
     mkdir -p "$CONFIG_DIR"
+    local config_tmp
+    config_tmp="$(mktemp "$CONFIG_DIR/.compile_deploy.XXXXXXXX")" || return $?
     {
         printf 'SCRIPT_DIR=%q\n' "$SCRIPT_DIR"
         printf 'SOURCE_DIR=%q\n' "$SOURCE_DIR"
@@ -79,7 +90,9 @@ save_config() {
         printf 'MPY_CROSS=%q\n' "$MPY_CROSS"
         printf 'SSH_TARGET=%q\n' "$SSH_TARGET"
         printf 'MPREMOTE=%q\n' "$MPREMOTE"
-    } > "$CONFIG_FILE"
+        printf 'GUARDIAN_URL=%q\n' "$GUARDIAN_URL"
+    } > "$config_tmp"
+    mv -- "$config_tmp" "$CONFIG_FILE"
 }
 
 load_config() {
@@ -141,160 +154,127 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
+# ---------- build / deployment ------------------------------------------------
+
+compile_all() (
+    # A compiler error leaves the previous build intact and touches no device.
+    local build py_file name
+    build="$(mktemp -d "$OUTPUT_DIR/.compile.XXXXXXXX")" || exit $?
+    trap 'rm -rf -- "$build"' EXIT
+    mapfile -d '' sources < <(find "$SOURCE_DIR" -maxdepth 1 -type f -name '*.py' -print0 | sort -z)
+    (( ${#sources[@]} )) || die "No .py files directly in $SOURCE_DIR"
+    echo "Compiling ${#sources[@]} module(s) ($ARCH)…"
+    for py_file in "${sources[@]}"; do
+        name="$(basename "$py_file" .py)"
+        echo "  $name.py"
+        "$MPY_CROSS" -march="$ARCH" "$py_file" -o "$build/$name.mpy" || exit $?
+        [[ -f "$build/$name.mpy" ]] || die "Compiler produced no output for $name.py"
+    done
+    find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.mpy' -delete || exit $?
+    cp -- "$build/"*.mpy "$OUTPUT_DIR/"
+)
+
+quote_command() {
+    local arg
+    for arg in "$@"; do printf "'%s' " "${arg//\'/\'\\\'\'}"; done
+}
+
+choose_files() {
+    local full_path filename choices
+    mapfile -d '' MPY_FILES < <(find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.mpy' -print0 | sort -z)
+    (( ${#MPY_FILES[@]} )) || { echo "No compiled .mpy files found."; return 1; }
+    OPTIONS=()
+    for full_path in "${MPY_FILES[@]}"; do
+        filename="$(basename "$full_path")"
+        [[ "$filename" != *$'\n'* ]] || die "Newlines in filenames are unsupported"
+        OPTIONS+=("$filename" "" "OFF")
+    done
+    choices="$(whiptail --title "Deploy and watch" --separate-output --checklist \
+        "Select modules to deploy:" 20 80 12 "${OPTIONS[@]}" 3>&1 1>&2 2>&3)" || return 1
+    [[ -n "$choices" ]] || return 1
+    mapfile -t SELECTED_FILES <<< "$choices"
+}
+
+choose_deploy_options() {
+    local options
+    options="$(whiptail --title "Deployment options" --separate-output --checklist \
+        "Reset is enabled by default. Space toggles; Enter deploys; Escape cancels." \
+        12 80 1 "reset" "Reset device after transfer" "ON" 3>&1 1>&2 2>&3)" || return 1
+    RESET_AFTER=0
+    if [[ "$options" == reset ]]; then RESET_AFTER=1; fi
+}
+
+deploy_files() (
+    local filename stage remote_command
+    local -a local_files=() remote_files=() reset_args=()
+    if [[ "$RESET_AFTER" == 0 ]]; then reset_args=(--no-reset); fi
+    [[ "$SSH_TARGET" != -* ]] || die "Invalid SSH target"
+    [[ -f "$CURRENT_SCRIPT_DIR/deploy_remote.py" ]] || die "Keep deploy_remote.py beside this script"
+    for filename in "${SELECTED_FILES[@]}"; do
+        [[ "$filename" != */* && "$filename" != -* && "$filename" != *$'\n'* && "$filename" == *.mpy ]] || die "Invalid module filename"
+        [[ -f "$OUTPUT_DIR/$filename" ]] || die "Missing compiled file: $filename; select files again."
+        local_files+=("$OUTPUT_DIR/$filename")
+    done
+    (( ${#local_files[@]} )) || die "No files selected"
+    echo "Staging ${#local_files[@]} file(s) on $SSH_TARGET…"
+    stage="$(ssh -o ConnectTimeout=10 -- "$SSH_TARGET" 'mktemp -d /tmp/serial-guardian-deploy.XXXXXXXX')" || exit $?
+    [[ "$stage" =~ ^/tmp/serial-guardian-deploy\.[A-Za-z0-9]+$ ]] || die "Invalid staging directory returned by SSH"
+    trap 'ssh -o ConnectTimeout=10 -- "$SSH_TARGET" "rm -rf -- $stage" </dev/null || true' EXIT
+    scp -- "$CURRENT_SCRIPT_DIR/deploy_remote.py" "${local_files[@]}" "$SSH_TARGET:$stage/" || exit $?
+    for filename in "${SELECTED_FILES[@]}"; do remote_files+=("$stage/$filename"); done
+    remote_command="$(quote_command python3 "$stage/deploy_remote.py" --url "$GUARDIAN_URL" \
+        --mpremote "$MPREMOTE" --wait "$DEPLOY_WAIT" --boot-wait "$BOOT_WAIT" \
+        --transfer-wait "$TRANSFER_WAIT" "${reset_args[@]}" -- "${remote_files[@]}")"
+    ssh -- "$SSH_TARGET" "$remote_command"
+)
+
 # ---------- main menu --------------------------------------------------------
 
+main_menu() {
+    local choice
+    cat >&2 <<'MENU'
+
+MicroPython Compile / Deploy
+  1  Compile all and deploy selected files
+  2  Deploy selected built files
+  3  Compile all .py files
+  4  Settings
+  5  Exit
+Press a number (no Enter needed):
+MENU
+    while IFS= read -r -s -n 1 choice; do
+        case "$choice" in
+            [1-5]) printf '%s' "$choice"; printf '\n' >&2; return 0 ;;
+            $'\e') printf '5'; return 0 ;;
+            '') ;; # Ignore Enter, including one typed after a number.
+            *) printf 'Choose 1–5: ' >&2 ;;
+        esac
+    done
+    return 1
+}
+
 while true; do
-    MENU_CHOICE="$(
-        whiptail --title "MicroPython Compile / Deploy" \
-            --menu "Choose an operation:" 15 75 5 \
-            "1" "Compile all .py files" \
-            "2" "Deploy selected files" \
-            "3" "Compile all, then deploy selected files" \
-            "4" "Settings" \
-            "5" "Exit" \
-            3>&1 1>&2 2>&3
-    )" || exit 0
-
+    MENU_CHOICE="$(main_menu)" || exit 0
     case "$MENU_CHOICE" in
-        1)
-            echo "=== Compiling all .py files ==="
-            echo "Source: $SOURCE_DIR"
-            echo "Output: $OUTPUT_DIR"
-            echo "Arch:   $ARCH"
-            echo
-
-            echo "Removing old .mpy files from output folder..."
-            find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.mpy' -delete
-
-            found=0
-            while IFS= read -r -d '' py_file; do
-                found=1
-                name="$(basename "$py_file" .py)"
-                output="$OUTPUT_DIR/$name.mpy"
-
-                echo "  $(basename "$py_file") -> $output"
-                "$MPY_CROSS" -march="$ARCH" "$py_file" -o "$output"
-            done < <(find "$SOURCE_DIR" -maxdepth 1 -type f -name '*.py' -print0 | sort -z)
-
-            if [[ "$found" -eq 0 ]]; then
-                echo "No .py files found directly in $SOURCE_DIR"
-            fi
-
-            echo
-            echo "=== Compile complete ==="
-            read -r -p "Press Enter to return to the menu..." _
+        3)
+            if compile_all; then echo "Compile complete."; else echo "Compilation failed; previous build retained."; fi
             ;;
-
-        2|3)
-            # Choice 3 explicitly compiles first.
-            if [[ "$MENU_CHOICE" == "3" ]]; then
-                echo "=== Compiling all .py files before deployment ==="
-                echo "Source: $SOURCE_DIR"
-                echo "Output: $OUTPUT_DIR"
-                echo "Arch:   $ARCH"
-                echo
-
-                echo "Removing old .mpy files from output folder..."
-                find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.mpy' -delete
-
-                found=0
-                while IFS= read -r -d '' py_file; do
-                    found=1
-                    name="$(basename "$py_file" .py)"
-                    output="$OUTPUT_DIR/$name.mpy"
-
-                    echo "  $(basename "$py_file") -> $output"
-                    "$MPY_CROSS" -march="$ARCH" "$py_file" -o "$output"
-                done < <(find "$SOURCE_DIR" -maxdepth 1 -type f -name '*.py' -print0 | sort -z)
-
-                if [[ "$found" -eq 0 ]]; then
-                    echo "No .py files found directly in $SOURCE_DIR"
+        1|2)
+            if [[ "$MENU_CHOICE" == 1 ]]; then
+                compile_all || { echo "Compilation failed; device untouched."; continue; }
+            fi
+            choose_files || continue
+            choose_deploy_options || continue
+            if deploy_files; then
+                if [[ "$RESET_AFTER" == 1 ]]; then
+                    whiptail --title "Boot detected" --msgbox "Deployment complete. Watch the Guardian Live dashboard." 8 70
+                else
+                    whiptail --title "Files transferred" --msgbox "Monitoring restored. Device left at the REPL; use Reset in Guardian when ready." 9 75
                 fi
-
-                echo
-                echo "=== Compile complete; continuing to deployment ==="
+            else
+                whiptail --title "Deployment stopped" --msgbox "See terminal output. Inspect Guardian before resuming the device; no automatic recovery reboot was requested." 10 75
             fi
-
-            # Build checklist from output .mpy files.
-            mapfile -d '' MPY_FILES < <(
-                find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.mpy' -print0 | sort -z
-            )
-
-            if [[ "${#MPY_FILES[@]}" -eq 0 ]]; then
-                whiptail --title "No files" \
-                    --msgbox "No .mpy files were found in:\n$OUTPUT_DIR" 10 70
-                continue
-            fi
-
-            OPTIONS=()
-            for full_path in "${MPY_FILES[@]}"; do
-                filename="$(basename "$full_path")"
-                OPTIONS+=("$filename" "" "OFF")
-            done
-
-            CHOICES="$(
-                whiptail --title "File Selector" \
-                    --checklist \
-                    "Select the .mpy files to deploy (Space = toggle, Enter = confirm):" \
-                    20 80 12 \
-                    "${OPTIONS[@]}" \
-                    3>&1 1>&2 2>&3
-            )" || {
-                echo "Deployment cancelled."
-                continue
-            }
-
-            # Whiptail returns quoted names. Read them safely without eval.
-            mapfile -t SELECTED_FILES < <(
-                printf '%s\n' "$CHOICES" |
-                grep -oE '"[^"]*"' |
-                sed 's/^"//; s/"$//'
-            )
-
-            if [[ "${#SELECTED_FILES[@]}" -eq 0 ]]; then
-                whiptail --title "No files selected" \
-                    --msgbox "No files were selected for deployment." 8 60
-                continue
-            fi
-
-            echo
-            echo "=== Starting deployment ==="
-            echo "Target: $SSH_TARGET"
-            echo "mpremote: $MPREMOTE"
-            echo "Files: ${#SELECTED_FILES[@]}"
-            echo
-
-            local_files=()
-            for filename in "${SELECTED_FILES[@]}"; do
-                local_file="$OUTPUT_DIR/$filename"
-                [[ -f "$local_file" ]] || die "Selected file does not exist: $local_file"
-                local_files+=("$local_file")
-            done
-
-            # Transfer all files in one SCP invocation. This keeps each selected
-            # filename as its own argument instead of treating the list as one path.
-            scp "${local_files[@]}" "$SSH_TARGET:/tmp/"
-
-            for filename in "${SELECTED_FILES[@]}"; do
-                remote_tmp="/tmp/$filename"
-                printf -v remote_tmp_quoted '%q' "$remote_tmp"
-
-                echo "----------------------------------------"
-                echo "Deploying: $filename"
-
-                ssh "$SSH_TARGET" \
-                    "$MPREMOTE cp $remote_tmp_quoted : && rm -f $remote_tmp_quoted"
-            done
-
-            echo "----------------------------------------"
-            echo "Deployment complete."
-
-            whiptail --title "Deployment complete" \
-                --msgbox \
-                "Successfully deployed ${#SELECTED_FILES[@]} file(s) to $SSH_TARGET." \
-                10 70
             ;;
-
         4)
             SOURCE_DIR_NEW="$(
                 input_box \
@@ -329,9 +309,6 @@ while true; do
                 continue
             }
 
-            SOURCE_DIR="$SOURCE_DIR_NEW"
-            OUTPUT_DIR="$OUTPUT_DIR_NEW"
-            MPY_CROSS="$MPY_CROSS_NEW"
             SSH_TARGET_NEW="$(
                 input_box \
                     "SSH target" \
@@ -346,8 +323,14 @@ while true; do
                     "$MPREMOTE"
             )" || continue
 
+            GUARDIAN_URL_NEW="$(input_box "Guardian on the Pi" \
+                "Guardian URL as reached from the Pi itself:" "$GUARDIAN_URL")" || continue
+            SOURCE_DIR="$SOURCE_DIR_NEW"
+            OUTPUT_DIR="$OUTPUT_DIR_NEW"
+            MPY_CROSS="$MPY_CROSS_NEW"
             SSH_TARGET="$SSH_TARGET_NEW"
             MPREMOTE="$MPREMOTE_NEW"
+            GUARDIAN_URL="$GUARDIAN_URL_NEW"
             mkdir -p "$OUTPUT_DIR"
             save_config
             ;;

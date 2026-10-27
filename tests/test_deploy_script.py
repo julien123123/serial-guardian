@@ -1,0 +1,124 @@
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+STUB = r'''#!/usr/bin/env python3
+import json, os, pathlib, shlex, sys
+name = pathlib.Path(sys.argv[0]).name
+with open(os.environ['TRACE'], 'a') as f:
+    f.write(json.dumps([name] + sys.argv[1:]) + '\n')
+if name == 'compiler':
+    if os.environ.get('FAIL_COMPILE'): sys.exit(42)
+    pathlib.Path(sys.argv[sys.argv.index('-o')+1]).write_bytes(b'compiled')
+elif name == 'ssh':
+    command = sys.argv[-1]
+    if command.startswith('mktemp'): print('/tmp/serial-guardian-deploy.Test1234')
+    elif not command.startswith('rm '):
+        with open(os.environ['REMOTE_ARGS'], 'w') as f: json.dump(shlex.split(command), f)
+        sys.exit(int(os.environ.get('FAIL_REMOTE', '0')))
+elif name == 'scp': sys.exit(int(os.environ.get('FAIL_SCP', '0')))
+elif name == 'whiptail':
+    if '--checklist' in sys.argv:
+        if os.environ.get('CANCEL_OPTIONS') and 'reset' in sys.argv: sys.exit(1)
+        if 'reset' in sys.argv:
+            if not os.environ.get('NO_RESET'): print('reset', file=sys.stderr)
+        else: print("a file.mpy\nb'file.mpy", file=sys.stderr)
+'''
+
+
+class DeployScriptTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = Path(tmp.name)
+        self.bin = self.base / 'bin'; self.bin.mkdir()
+        for tool in ['ssh', 'scp', 'whiptail', 'compiler']:
+            path = self.bin / tool; path.write_text(STUB); path.chmod(0o755)
+        self.source = self.base / 'source'; self.source.mkdir()
+        self.output = self.base / 'built'; self.output.mkdir()
+        for name in ['a file.py', "b'file.py"]:
+            (self.source / name).write_text('pass\n')
+        self.config = self.base / 'config/serial-guardian'; self.config.mkdir(parents=True)
+        self.trace = self.base / 'trace'
+        self.remote = self.base / 'remote-args'
+        self.env = dict(os.environ, PATH=str(self.bin)+os.pathsep+os.environ['PATH'],
+                        XDG_CONFIG_HOME=str(self.base/'config'), TRACE=str(self.trace),
+                        REMOTE_ARGS=str(self.remote), MENU_COUNTER=str(self.base/'menu-counter'))
+        self.write_config()
+
+    def write_config(self, remembered=False):
+        values = dict(SCRIPT_DIR=str(ROOT), SOURCE_DIR=str(self.source), OUTPUT_DIR=str(self.output),
+                      MPY_CROSS=str(self.bin/'compiler'), SSH_TARGET='pi@test-host', MPREMOTE='python3 -m mpremote')
+        if remembered:
+            values['LAST_SELECTION_KEY'] = f'{self.source}|{self.output}|pi@test-host'
+        text = ''.join(f'{key}={shlex.quote(value)}\n' for key, value in values.items())
+        if remembered: text += "LAST_SELECTED_FILES=(" + ' '.join(map(shlex.quote, ['a file.mpy', "b'file.mpy"])) + ')\n'
+        (self.config/'compile_deploy.conf').write_text(text)
+
+    def run_script(self, *args, **extra):
+        menu_input = extra.pop('MENU_INPUT', '15')
+        return subprocess.run(['bash', str(ROOT/'compile_deploy.sh'), *args], env=dict(self.env, **extra),
+                              capture_output=True, text=True, input=menu_input, timeout=15)
+
+    def trace_rows(self):
+        return [json.loads(line) for line in self.trace.read_text().splitlines()] if self.trace.exists() else []
+
+    def test_first_option_and_number_keys_run_without_enter(self):
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertIn('1  Compile all and deploy selected files', result.stderr)
+        rows = self.trace_rows()
+        self.assertEqual(sum(row[0] == 'compiler' for row in rows), 2)
+        self.assertFalse(any(row[0] == 'whiptail' and '--menu' in row for row in rows))
+        args = json.loads(self.remote.read_text())
+        self.assertNotIn('--no-reset', args)
+        self.assertEqual(args[args.index('--mpremote')+1], 'python3 -m mpremote')
+        self.assertEqual(args[-2:], ['/tmp/serial-guardian-deploy.Test1234/a file.mpy', "/tmp/serial-guardian-deploy.Test1234/b'file.mpy"])
+        self.assertLess(next(i for i,r in enumerate(rows) if r[0]=='scp'), next(i for i,r in enumerate(rows) if r[0]=='ssh' and 'deploy_remote.py' in r[-1]))
+        options = next(row for row in rows if row[0]=='whiptail' and 'reset' in row)
+        self.assertEqual(options[options.index('reset')+2], 'ON')
+
+    def test_selections_start_empty_every_time_even_with_old_config(self):
+        self.write_config(remembered=True)
+        result = self.run_script(MENU_INPUT='115')
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        checklists = [row for row in self.trace_rows() if row[0]=='whiptail' and '--checklist' in row and 'reset' not in row]
+        self.assertEqual(len(checklists), 2)
+        for checklist in checklists:
+            self.assertEqual(checklist[checklist.index('a file.mpy')+2], 'OFF')
+            self.assertEqual(checklist[checklist.index("b'file.mpy")+2], 'OFF')
+
+    def test_reset_can_be_disabled(self):
+        result = self.run_script(NO_RESET='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--no-reset', json.loads(self.remote.read_text()))
+
+    def test_cancel_deployment_options_leaves_device_untouched(self):
+        result = self.run_script(CANCEL_OPTIONS='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(row[0] in ['ssh','scp'] for row in self.trace_rows()))
+
+    def test_compile_failure_does_not_stage_or_delete_previous_build(self):
+        old = self.output / 'previous.mpy'; old.write_bytes(b'previous')
+        result = self.run_script(FAIL_COMPILE='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Compilation failed', result.stdout)
+        self.assertEqual(old.read_bytes(), b'previous')
+        self.assertFalse(any(row[0] in ['ssh','scp'] for row in self.trace_rows()))
+
+    def test_staging_failure_never_starts_coordinator(self):
+        result = self.run_script(FAIL_SCP='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.remote.exists())
+        self.assertTrue(any(row[0]=='ssh' and row[-1].startswith('rm ') for row in self.trace_rows()))
+
+    def test_compile_only_is_option_three(self):
+        result = self.run_script(MENU_INPUT='35')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sum(row[0]=='compiler' for row in self.trace_rows()), 2)
+        self.assertFalse(any(row[0] in ['ssh','scp'] for row in self.trace_rows()))

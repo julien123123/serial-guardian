@@ -78,14 +78,26 @@ Run it from anywhere:
 ./compile_deploy.sh
 ```
 
-The first run asks for the source folder, output folder, `mpy-cross`
-executable, SSH target (for example `pi@guardian.local`), and the remote
-`mpremote` command. These values are saved in
-`~/.config/serial-guardian/compile_deploy.conf`, so later runs go directly
-to the menu. If the script is moved to a different directory, it asks for
-the paths and target again. Use **Settings** in the menu to change them
-without moving the script. The deploy workflow supports selecting multiple
-compiled files at once.
+Keep `deploy_remote.py` beside the shell script. On first run, configure the
+source/output folders, `mpy-cross`, SSH target, and the Pi's `mpremote`
+executable (or `python3 -m mpremote`). Settings are saved in
+`~/.config/serial-guardian/compile_deploy.conf`.
+
+The first menu option is **Compile all and deploy selected files**. Press its
+number to run it immediately; no Enter is needed. Each deployment starts
+with an empty file selection. **Reset device after transfer** is checked by
+default and can be unchecked before deploying.
+
+The script handles compile → stage on Pi → stop on next wake → release
+serial → transfer → restore monitoring. With Reset enabled, it also resets
+the device and waits for the configured boot marker. With Reset disabled,
+it leaves the device at the REPL for you to reset later from Guardian.
+Update and restart Guardian on the Pi first; the script needs the new
+`/api/status` endpoint.
+
+Run `./compile_deploy.sh` in your terminal, including PyCharm's built-in
+terminal. See [the guide](docs/GUIDE.md#4-compile-and-deploy-micropython-files)
+for the handoff, failure behavior, and timeout settings.
 
 ## Built for
 

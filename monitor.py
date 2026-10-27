@@ -74,7 +74,10 @@ class SerialSessionMonitor:
         self.lock = threading.Lock()
 
         self.connected = False
+        self.boot_count = 0
         self.live_tail = collections.deque(maxlen=cfg.LIVE_TAIL_LINES)
+        self.live_times = collections.deque(maxlen=cfg.LIVE_TAIL_LINES)
+        self.live_started = time.time()
         self.last_session_id = 0
 
         # Cross-session state for the manual stop/resume feature.
@@ -249,6 +252,7 @@ class SerialSessionMonitor:
 
         if self.cfg.BOOT_BANNER_MARKER in line:
             with self.lock:
+                self.boot_count += 1
                 self._currently_halted = False
             if self._awaiting_boot:
                 # Fresh boot right after our own soft reset -- split into a
@@ -261,6 +265,7 @@ class SerialSessionMonitor:
         with self.lock:
             self._lines.append(line)
             self.live_tail.append(line.rstrip("\n"))
+            self.live_times.append(now)
 
         if not self._is_exception and not self._user_stopped:
             for marker in self.cfg.EXCEPTION_MARKERS:
@@ -532,6 +537,9 @@ class SerialSessionMonitor:
         with self.lock:
             return {
                 "connected": self.connected,
+                "serial_open": self._ser is not None,
+                "serial_port": self.cfg.SERIAL_PORT,
+                "boot_count": self.boot_count,
                 "monitoring": self._monitoring_on,
                 "pause_pending": self._pause_pending,
                 "stats": dict(self.stats),
@@ -544,6 +552,12 @@ class SerialSessionMonitor:
         with self.lock:
             return list(self.live_tail)
 
+    def get_timed_tail(self):
+        """A bounded timestamped snapshot for interleaving timeline labels."""
+        with self.lock:
+            return [{"type": "log", "ts": ts, "text": text}
+                    for ts, text in zip(self.live_times, self.live_tail)]
+
     def resize_live_tail(self):
         """Rebuild the live-tail buffer to the current cfg.LIVE_TAIL_LINES
         (a plain deque's maxlen can't be changed after creation). Cheap
@@ -551,6 +565,7 @@ class SerialSessionMonitor:
         whether or not that particular value actually changed."""
         with self.lock:
             self.live_tail = collections.deque(self.live_tail, maxlen=self.cfg.LIVE_TAIL_LINES)
+            self.live_times = collections.deque(self.live_times, maxlen=self.cfg.LIVE_TAIL_LINES)
 
     def recent_sessions(self, n=100, status=None):
         return self.recent_sessions_window(n, status)[0]
