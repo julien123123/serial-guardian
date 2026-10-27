@@ -11,6 +11,7 @@ set -euo pipefail
 #   4. Stage, stop/release, transfer, restore monitoring; optionally reset
 #
 # Dependencies:
+#   - python3 (local menu keyboard adapter)
 #   - whiptail
 #   - ssh
 #   - scp
@@ -55,6 +56,7 @@ case "${1:-}" in
     --help|-h) echo "Usage: $0"; exit 0 ;;
     *) die "Usage: $0 (choose files interactively for every deployment)" ;;
 esac
+require_cmd python3
 require_cmd whiptail
 require_cmd ssh
 require_cmd scp
@@ -195,8 +197,8 @@ choose_files() {
     mapfile -t SELECTED_FILES <<< "$choices"
 }
 
-# Embedded so this file can be copied and run on its own. Materialized only
-# in a temporary directory for the SSH handoff; Python runs on the Pi.
+# Embedded coordinator runs directly via SSH's command channel. No helper
+# file is created or copied to the Pi; SCP transfers only selected modules.
 write_deploy_helper() {
     cat <<'GUARDIAN_DEPLOY_PY'
 #!/usr/bin/env python3
@@ -241,13 +243,28 @@ class Guardian:
 
 
 def wait_for(guardian, predicate, timeout, description):
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
+    tick, next_report = 0, started
     while True:
         state = guardian.status()
+        elapsed = time.monotonic() - started
         if predicate(state):
+            print(('\r\033[K' if sys.stdout.isatty() else '') + '[ok] {} ({:.1f}s)'.format(description, elapsed), flush=True)
             return state
         if time.monotonic() >= deadline:
+            if sys.stdout.isatty(): print('\r\033[K', end='', flush=True)
             raise DeploymentError('Timed out: ' + description)
+        if sys.stdout.isatty() or time.monotonic() >= next_report:
+            detail = 'connected' if state['connected'] else 'waiting for USB'
+            if not state['monitoring']: detail += ' / monitor paused'
+            if state.get('stop_armed'): detail += ' / Stop armed'
+            message = '[{}] {} | {:.0f}/{:.0f}s | {}'.format('|/-\\'[tick % 4], description.split(' (')[0], elapsed, timeout, detail)
+            if sys.stdout.isatty(): message = message[:max(20, shutil.get_terminal_size().columns-1)]
+            print(('\r\033[K' if sys.stdout.isatty() else '') + message,
+                  end='' if sys.stdout.isatty() else '\n', flush=True)
+            tick += 1
+            next_report = time.monotonic() + 5
         time.sleep(0.25)
 
 
@@ -342,7 +359,7 @@ def main():
             deploy(Guardian(args.url), args.files, args.mpremote,
                    args.wait, args.boot_wait, args.transfer_wait, reset=not args.no_reset)
         except (Exception, KeyboardInterrupt) as exc:
-            print('Deployment stopped: {}\nNo further reset/resume will be attempted. '
+            print('\nDeployment stopped: {}\nNo further reset/resume will be attempted. '
                   'If transfer failed, leave the device halted and retry; '
                   'a pending Stop may need cancellation in the dashboard.'.format(exc), file=sys.stderr)
             return 1
@@ -355,7 +372,7 @@ GUARDIAN_DEPLOY_PY
 }
 
 deploy_files() (
-    local filename stage remote_command helper_dir
+    local filename stage remote_command coordinator
     local -a local_files=() remote_files=() reset_args=()
     if [[ "$RESET_AFTER" == 0 ]]; then reset_args=(--no-reset); fi
     [[ "$SSH_TARGET" != -* ]] || die "Invalid SSH target"
@@ -365,16 +382,14 @@ deploy_files() (
         local_files+=("$OUTPUT_DIR/$filename")
     done
     (( ${#local_files[@]} )) || die "No files selected"
-    helper_dir="$(mktemp -d "${TMPDIR:-/tmp}/serial-guardian-helper.XXXXXXXX")" || exit $?
-    trap 'rm -rf -- "$helper_dir"' EXIT
-    write_deploy_helper > "$helper_dir/deploy_remote.py" || exit $?
     echo "Staging ${#local_files[@]} file(s) on $SSH_TARGET…"
     stage="$(ssh -o ConnectTimeout=10 -- "$SSH_TARGET" 'mktemp -d /tmp/serial-guardian-deploy.XXXXXXXX')" || exit $?
     [[ "$stage" =~ ^/tmp/serial-guardian-deploy\.[A-Za-z0-9]+$ ]] || die "Invalid staging directory returned by SSH"
-    trap 'rm -rf -- "$helper_dir"; ssh -o ConnectTimeout=10 -- "$SSH_TARGET" "rm -rf -- $stage" </dev/null || true' EXIT
-    scp -- "$helper_dir/deploy_remote.py" "${local_files[@]}" "$SSH_TARGET:$stage/" || exit $?
+    trap 'ssh -o ConnectTimeout=10 -- "$SSH_TARGET" "rm -rf -- $stage" </dev/null || true' EXIT
+    scp -- "${local_files[@]}" "$SSH_TARGET:$stage/" || exit $?
     for filename in "${SELECTED_FILES[@]}"; do remote_files+=("$stage/$filename"); done
-    remote_command="$(quote_command python3 "$stage/deploy_remote.py" --url "$GUARDIAN_URL" \
+    coordinator="$(write_deploy_helper)"
+    remote_command="$(quote_command python3 -c "$coordinator" --url "$GUARDIAN_URL" \
         --mpremote "$MPREMOTE" --wait "$DEPLOY_WAIT" --boot-wait "$BOOT_WAIT" \
         --transfer-wait "$TRANSFER_WAIT" "${reset_args[@]}" -- "${remote_files[@]}")"
     # A remote PTY forwards Ctrl+C and sends SIGHUP if SSH disconnects.
@@ -386,15 +401,84 @@ deploy_files() (
 RESET_AFTER=1
 MENU_DEFAULT=1
 
+# Translate numeric shortcuts to native Home/Down keys inside an otherwise
+# unchanged whiptail dialog. The chosen tag still comes from whiptail itself.
+number_menu() {
+    python3 -c "$(cat <<'NUMBER_MENU_PY'
+import errno, fcntl, os, pty, select, signal, struct, subprocess, sys, termios, tty
+if not sys.stdin.isatty():
+    sys.exit(subprocess.call(sys.argv[1:]))
+terminal = os.open('/dev/tty', os.O_RDWR)
+master, slave = pty.openpty()
+def resize(*args):
+    size = fcntl.ioctl(terminal, termios.TIOCGWINSZ, b'\0' * 8)
+    fcntl.ioctl(master, termios.TIOCSWINSZ, size)
+def setup():
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+resize()
+old = termios.tcgetattr(terminal)
+process = None
+try:
+    process = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave,
+                               stderr=subprocess.PIPE, preexec_fn=setup)
+    os.close(slave)
+    tty.setraw(terminal)
+    signal.signal(signal.SIGWINCH, resize)
+    shortcuts = {ord(key): index for index, key in enumerate('123645')}
+    escape = bytearray()
+    mouse_bytes = 0
+    while process.poll() is None:
+        readable, _, _ = select.select([master, terminal], [], [], .1)
+        for fd in readable:
+            if fd == master:
+                try: data = os.read(master, 65536)
+                except OSError as error:
+                    if error.errno == errno.EIO: continue
+                    raise
+                os.write(terminal, data)
+            else:
+                data = os.read(terminal, 512)
+                if not data:
+                    process.terminate(); break
+                for key in data:
+                    if mouse_bytes:
+                        os.write(master, bytes([key])); mouse_bytes -= 1
+                    elif escape:
+                        escape.append(key)
+                        if len(escape) == 2 and key not in b'[O' or len(escape) >= 3 and 0x40 <= key <= 0x7e:
+                            os.write(master, escape)
+                            if escape == b'\x1b[M': mouse_bytes = 3
+                            escape.clear()
+                    elif key == 27:
+                        escape.append(key)
+                    elif key in shortcuts:
+                        os.write(master, b'\x1b[H' + b'\x1b[B' * shortcuts[key] + b'\r')
+                    else:
+                        os.write(master, bytes([key]))
+        # Standalone Escape must reach whiptail as well as escape sequences.
+        if escape and not select.select([terminal], [], [], .05)[0]:
+            os.write(master, escape); escape.clear()
+    sys.stdout.buffer.write(process.stderr.read())
+    sys.exit(process.wait() if process.returncode >= 0 else 128-process.returncode)
+finally:
+    termios.tcsetattr(terminal, termios.TCSADRAIN, old)
+    os.close(terminal); os.close(master)
+    if process is not None and process.poll() is None:
+        process.terminate(); process.wait()
+NUMBER_MENU_PY
+)" "$@"
+}
+
 main_menu() {
     local reset_mark='[x]'
     if [[ "$RESET_AFTER" == 0 ]]; then reset_mark='[ ]'; fi
-    whiptail --title "MicroPython Compile / Deploy" --default-item "$MENU_DEFAULT" \
-        --menu "Choose an operation. Select Reset and press Enter to toggle its check mark." 18 85 6 \
+    number_menu whiptail --title "MicroPython Compile / Deploy" --default-item "$MENU_DEFAULT" \
+        --menu "Press 1-6 to activate immediately. Arrows + Enter also work. 6 toggles Reset." 18 85 6 \
         "1" "Compile all and deploy selected files" \
         "2" "Deploy selected built files" \
         "3" "Compile all .py files" \
-        "R" "$reset_mark Reset device after transfer" \
+        "6" "$reset_mark Reset device after transfer" \
         "4" "Settings" "5" "Exit" 3>&1 1>&2 2>&3
 }
 
@@ -402,26 +486,25 @@ while true; do
     MENU_CHOICE="$(main_menu)" || exit 0
     MENU_DEFAULT=1
     case "$MENU_CHOICE" in
-        R)
+        6)
             if [[ "$RESET_AFTER" == 1 ]]; then RESET_AFTER=0; else RESET_AFTER=1; fi
-            MENU_DEFAULT=R
+            MENU_DEFAULT=6
             ;;
         3)
-            if compile_all; then echo "Compile complete."; else echo "Compilation failed; previous build retained."; fi
+            if compile_all; then echo "Compile complete."; exit 0
+            else echo "Compilation failed; previous build retained." >&2; exit 1; fi
             ;;
         1|2)
             if [[ "$MENU_CHOICE" == 1 ]]; then
-                compile_all || { echo "Compilation failed; device untouched."; continue; }
+                compile_all || { echo "Compilation failed; device untouched." >&2; exit 1; }
             fi
-            choose_files || continue
+            choose_files || exit 0
             if deploy_files; then
-                if [[ "$RESET_AFTER" == 1 ]]; then
-                    whiptail --title "Boot detected" --msgbox "Deployment complete. Watch the Guardian Live dashboard." 8 70
-                else
-                    whiptail --title "Files transferred" --msgbox "Monitoring restored. Device left at the REPL; use Reset in Guardian when ready." 9 75
-                fi
+                echo "Deployment complete."
+                exit 0
             else
-                whiptail --title "Deployment stopped" --msgbox "See terminal output. Inspect Guardian before resuming the device; no automatic recovery reboot was requested." 10 75
+                echo "Deployment stopped. Inspect Guardian before resuming the device." >&2
+                exit 1
             fi
             ;;
         4)

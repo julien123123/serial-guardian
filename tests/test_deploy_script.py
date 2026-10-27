@@ -23,10 +23,9 @@ elif name == 'ssh':
         with open(os.environ['REMOTE_ARGS'], 'w') as f: json.dump(shlex.split(command), f)
         sys.exit(int(os.environ.get('FAIL_REMOTE', '0')))
 elif name == 'scp':
-    helper = pathlib.Path(sys.argv[2])
-    source = helper.read_text()
-    compile(source, str(helper), 'exec')
-    pathlib.Path(os.environ['STAGED_HELPER']).write_text(source)
+    files = sys.argv[2:-1]
+    assert files and all(pathlib.Path(path).suffix == '.mpy' for path in files), files
+    pathlib.Path(os.environ['TRANSFER_FILES']).write_text(json.dumps(files))
     sys.exit(int(os.environ.get('FAIL_SCP', '0')))
 elif name == 'whiptail':
     if '--menu' in sys.argv:
@@ -62,7 +61,7 @@ class DeployScriptTest(unittest.TestCase):
         self.remote = self.base / 'remote-args'
         self.env = dict(os.environ, PATH=str(self.bin)+os.pathsep+os.environ['PATH'],
                         XDG_CONFIG_HOME=str(self.base/'config'), TRACE=str(self.trace),
-                        REMOTE_ARGS=str(self.remote), MENU_COUNTER=str(self.base/'menu-counter'), STAGED_HELPER=str(self.base/'staged-helper.py'))
+                        REMOTE_ARGS=str(self.remote), MENU_COUNTER=str(self.base/'menu-counter'), TRANSFER_FILES=str(self.base/'transfer-files'))
         self.write_config()
 
     def write_config(self, remembered=False):
@@ -90,21 +89,29 @@ class DeployScriptTest(unittest.TestCase):
         menu = next(row for row in rows if row[0]=='whiptail' and '--menu' in row)
         items = menu[menu.index('--menu')+5:]
         self.assertEqual(items[items.index('1')+1], 'Compile all and deploy selected files')
-        self.assertEqual(items[items.index('R')+1], '[x] Reset device after transfer')
+        self.assertEqual(items[items.index('6')+1], '[x] Reset device after transfer')
         self.assertFalse((self.standalone/'deploy_remote.py').exists())
-        self.assertTrue((self.base/'staged-helper.py').is_file())
+        transferred = json.loads((self.base/'transfer-files').read_text())
+        self.assertEqual([Path(path).name for path in transferred], ['a file.mpy', "b'file.mpy"])
         args = json.loads(self.remote.read_text())
         self.assertNotIn('--no-reset', args)
-        remote_ssh = next(row for row in rows if row[0]=='ssh' and 'deploy_remote.py' in row[-1])
+        self.assertEqual(args[:2], ['python3', '-c'])
+        compile(args[2], '<inline coordinator>', 'exec')
+        self.assertEqual(sum(row[0]=='whiptail' and '--menu' in row for row in rows), 1)
+        self.assertFalse(any('--msgbox' in row for row in rows))
+        remote_ssh = next(row for row in rows if row[0]=='ssh' and "'-c'" in row[-1])
         self.assertIn('-tt', remote_ssh)
         self.assertEqual(args[args.index('--mpremote')+1], 'python3 -m mpremote')
         self.assertEqual(args[-2:], ['/tmp/serial-guardian-deploy.Test1234/a file.mpy', "/tmp/serial-guardian-deploy.Test1234/b'file.mpy"])
-        self.assertLess(next(i for i,r in enumerate(rows) if r[0]=='scp'), next(i for i,r in enumerate(rows) if r[0]=='ssh' and 'deploy_remote.py' in r[-1]))
+        self.assertLess(next(i for i,r in enumerate(rows) if r[0]=='scp'), next(i for i,r in enumerate(rows) if r[0]=='ssh' and "'-c'" in r[-1]))
         self.assertFalse(any('Deployment options' in row for row in rows))
 
     def test_selections_start_empty_every_time_even_with_old_config(self):
         self.write_config(remembered=True)
-        result = self.run_script(MENU_INPUT='115')
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        (self.base/'menu-counter').unlink()
+        result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         checklists = [row for row in self.trace_rows() if row[0]=='whiptail' and '--checklist' in row and 'reset' not in row]
         self.assertEqual(len(checklists), 2)
@@ -113,13 +120,13 @@ class DeployScriptTest(unittest.TestCase):
             self.assertEqual(checklist[checklist.index("b'file.mpy")+2], 'OFF')
 
     def test_reset_can_be_disabled(self):
-        result = self.run_script(MENU_INPUT='R15')
+        result = self.run_script(MENU_INPUT='615')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('--no-reset', json.loads(self.remote.read_text()))
         menus = [row for row in self.trace_rows() if row[0]=='whiptail' and '--menu' in row]
         items = menus[1][menus[1].index('--menu')+5:]
-        self.assertEqual(items[items.index('R')+1], '[ ] Reset device after transfer')
-        self.assertEqual(menus[1][menus[1].index('--default-item')+1], 'R')
+        self.assertEqual(items[items.index('6')+1], '[ ] Reset device after transfer')
+        self.assertEqual(menus[1][menus[1].index('--default-item')+1], '6')
 
     def test_cancel_file_selection_leaves_device_untouched(self):
         result = self.run_script(CANCEL_FILES='1')
@@ -129,14 +136,14 @@ class DeployScriptTest(unittest.TestCase):
     def test_compile_failure_does_not_stage_or_delete_previous_build(self):
         old = self.output / 'previous.mpy'; old.write_bytes(b'previous')
         result = self.run_script(FAIL_COMPILE='1')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('Compilation failed', result.stdout)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('Compilation failed', result.stderr)
         self.assertEqual(old.read_bytes(), b'previous')
         self.assertFalse(any(row[0] in ['ssh','scp'] for row in self.trace_rows()))
 
     def test_staging_failure_never_starts_coordinator(self):
         result = self.run_script(FAIL_SCP='1')
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
         self.assertFalse(self.remote.exists())
         self.assertTrue(any(row[0]=='ssh' and row[-1].startswith('rm ') for row in self.trace_rows()))
 

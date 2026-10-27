@@ -68,7 +68,7 @@ are in **[docs/GUIDE.md](docs/GUIDE.md)**.
 Install its dependencies on the development computer:
 
 ```bash
-sudo apt install -y whiptail openssh-client
+sudo apt install -y python3 whiptail openssh-client
 chmod +x compile_deploy.sh
 ```
 
@@ -84,11 +84,15 @@ source/output folders, `mpy-cross`, SSH target, and the Pi's `mpremote`
 executable (or `python3 -m mpremote`). Settings are saved in
 `~/.config/serial-guardian/compile_deploy.conf`.
 
-The original dialog menu opens with **Compile all and deploy selected
-files** first. Use the arrow keys and Enter. **[x] Reset device after
-transfer** is on that same first screen and enabled by default; select its
-row and press Enter to toggle it before choosing an action. Each deployment
-starts with an empty file selection.
+The dialog menu opens with **Compile all and deploy selected files** first.
+Press a number to activate an item immediately, without Enter; arrow keys
+and Enter also work. **6 — [x] Reset device after transfer** is enabled by
+default; press `6` to toggle it before choosing an action. Each deployment
+starts with an empty file selection. Completed operations exit to your shell.
+
+Only selected `.mpy` files are uploaded. The embedded coordinator runs directly
+through SSH without creating or transferring a Python helper file. Waiting
+stages show an animated indicator, elapsed time, and device/monitor state.
 
 The script handles compile → stage on Pi → stop on next wake → release
 serial → transfer → restore monitoring. With Reset enabled, it also resets

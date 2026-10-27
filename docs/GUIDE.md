@@ -115,7 +115,7 @@ Pi. It runs on the development computer, not on the Pi.
 Install the local dependencies and make the script executable:
 
 ```
-sudo apt install -y whiptail openssh-client
+sudo apt install -y python3 whiptail openssh-client
 chmod +x compile_deploy.sh
 ```
 
@@ -141,24 +141,26 @@ have changed. To change any value without moving the script, choose
 **Settings** from the menu.
 
 Only `compile_deploy.sh` needs to be copied to your development computer;
-there is no companion Python file to keep beside it. The coordinator is
-embedded in the script and written to a temporary directory when needed,
-then staged on the Pi and cleaned up automatically. Python 3, `mpremote`,
+there is no companion Python file to keep beside it. Only selected `.mpy`
+files are uploaded. The embedded coordinator runs as an inline Python command
+over SSH; no Python helper file is created on the Pi. Local Python 3 provides
+the main menu's numeric-key adapter while keeping the `whiptail` interface.
+Python 3, `mpremote`,
 and a running, updated Guardian are required on the Pi. Restart Guardian
 after updating `monitor.py` and `webapp.py`; deployments use `/api/status`.
 No compiler is installed on the Pi.
 
 The original `whiptail` dialog menu is restored. Its first item is **Compile
-all and deploy selected files**. Use Up/Down to select an item and Enter to
-activate it. Option 2 deploys existing compiled files; option 3 compiles
+all and deploy selected files**. Press `1`–`6` to activate an item immediately,
+without Enter. Up/Down and Enter still work. Option 2 deploys existing compiled
+files; option 3 compiles
 without deploying. Run `./compile_deploy.sh` in an interactive terminal,
 including PyCharm's built-in terminal.
 
 **[x] Reset device after transfer** appears on the first menu screen, enabled
-by default. Select this row and press Enter to toggle it to **[ ]**. The
-menu redraws with focus on that row and retains your choice until you exit
-the script; a new run starts checked again. There is no separate reset
-prompt after choosing files. With reset disabled, uploading restores
+by default. Press `6` to toggle it to **[ ]**, or select the row with arrows
+and press Enter. The menu redraws with focus on that row. A new run starts
+checked again. There is no separate reset prompt after choosing files. With reset disabled, uploading restores
 monitoring and keeps the device at its REPL for a later manual Reset.
 Every file checklist starts empty; file choices are not remembered.
 
@@ -166,7 +168,7 @@ The coordinated deployment performs these steps:
 
 1. Compile locally for option 1. A compilation error retains the previous
    build and does not touch the board.
-2. Copy the modules and coordinator into a unique temporary folder on the Pi.
+2. Copy only the selected modules into a unique temporary folder on the Pi.
 3. Arm Stop if needed and wait for it to take effect on the next wake.
 4. Pause monitoring and wait until the serial connection has actually closed.
 5. Copy all selected files through one `mpremote` connection, using Guardian's
@@ -175,6 +177,12 @@ The coordinated deployment performs these steps:
 7. If Reset was selected, request Reset through Guardian so the dashboard
    captures startup, then wait for `BOOT_BANNER_MARKER`. Otherwise, leave the
    board at its REPL and use Reset in Guardian whenever you are ready.
+
+Waiting stages display a spinner, elapsed/maximum seconds, and current USB,
+monitoring and Stop state. `mpremote` reports transfer progress. When the
+operation completes, the script prints the result and exits to the shell;
+it does not reopen the menu or start another deployment. Failures exit with
+a nonzero status. Cancelling file selection exits without touching the board.
 
 "Boot detected" confirms that marker, not the health of every part of the
 application. Keep Live open to watch output. Avoid changing device or monitor
@@ -213,7 +221,7 @@ inspect it with `ssh pi@guardian.local 'ps -eo pid,etime,args | grep "[s]erial-g
 and terminate only its Python coordinator PID. Do not delete the lock file:
 that does not stop its owner and could allow simultaneous deployments.
 
-Temporary staging folders are cleaned up on exit when SSH is reachable.
+Temporary module-staging folders are cleaned up on exit when SSH is reachable.
 
 ## 5. Run it as a service
 

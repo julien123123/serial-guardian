@@ -25,7 +25,8 @@ class CancellationTest(unittest.TestCase):
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                self.wfile.write(body)
+                try: self.wfile.write(body)
+                except BrokenPipeError: pass  # expected if cancellation interrupts a request
 
             def do_POST(self):
                 actions.append(self.path)
