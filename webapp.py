@@ -11,6 +11,7 @@ sessions", and the Settings page -- is reachable by anyone who can reach
 the Pi on your network. Fine on a trusted home LAN, worth knowing if
 that's not your situation.
 """
+import html
 import json
 import math
 import subprocess
@@ -37,6 +38,9 @@ STATUS_COLORS = {
 # the usual refresh/power glyphs. All use currentColor so CSS state
 # classes (.lit / .flashing / etc) can recolor them.
 ICONS = {
+    "repl": ('<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" '
+             'stroke-linecap="square" stroke-linejoin="miter">'
+             '<path d="M4 5l5 5-5 5M11 15h5"/></svg>'),
     "export": ('<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" '
                'stroke-linecap="round" stroke-linejoin="round">'
                '<path d="M10 3v9M6.5 8.5 10 12l3.5-3.5M4 13v4h12v-4"/></svg>'),
@@ -243,7 +247,7 @@ BASE = """
      they sit in the same place in the log whatever filter is active. */
   /* Let the last separator's control extend below its border without
      changing the spacing to the hint below the table. */
-  .session-table { overflow-x:auto; padding-bottom:11px; margin-bottom:-11px; }
+  .session-table { padding-bottom:11px; margin-bottom:-11px; overflow-wrap:anywhere; }
   .session-tools { display:flex; align-items:flex-start; gap:0.75rem; margin-bottom:0.75rem; }
   .session-tools .filters { flex:1; flex-wrap:wrap; margin:0; }
   .export-control { margin-left:auto; flex:none; }
@@ -289,7 +293,24 @@ BASE = """
   .session-row td { vertical-align:middle; }
   .session-row:has([aria-expanded=true]) td { background:var(--panel); }
   tr.session-log td { padding:0; }
-  tr.session-log pre.term { height:auto; max-height:55vh; border-left:2px solid var(--cyan); }
+  pre.session-document { height:auto; overflow:visible; overflow-wrap:anywhere; word-break:normal; }
+  tr.session-log pre.term { height:auto; overflow:visible; overflow-wrap:anywhere; word-break:normal;
+    border-left:2px solid var(--cyan); }
+  @media (max-width:640px) {
+    .session-table table, .session-table thead, .session-table tbody { display:block; }
+    .session-table tr { display:flex; flex-wrap:wrap; }
+    .session-table th, .session-table td { width:100%; min-width:0; padding-left:0.4rem; padding-right:0.4rem; }
+    .session-table th { font-size:0.65rem; }
+    .session-table th:nth-child(1), .session-row td:nth-child(1) { width:17%; }
+    .session-table th:nth-child(2), .session-row td:nth-child(2) { width:33%; }
+    .session-table th:nth-child(3), .session-row td:nth-child(3) { width:23%; }
+    .session-table th:nth-child(4), .session-row td:nth-child(4) { width:27%; }
+    .session-table th.extra { display:none; }
+    .session-row { border-bottom:1px solid var(--line); }
+    .session-row td { border-bottom:0; }
+    .session-row td.extra { width:33.333%; padding-top:0; font-size:0.75rem; }
+    .session-row td.extra::before { content:attr(data-field); display:block; font-size:0.65rem; }
+  }
   .log-message { padding:0.75rem; color:var(--ink-dim); }
   /* Insertion controls overlay the existing border. Closed gaps occupy no
      space, so every session keeps the table's original vertical rhythm. */
@@ -413,6 +434,9 @@ def create_app(monitor, cfg):
                   <button id="resumeItem" class="tb-icon" style="display:none"
                           title="Resume normal operation" aria-label="Resume device"
                           onclick="doResume()">{ICONS['play']}</button>
+                  <button id="replItem" class="tb-icon"
+                          title="Enter REPL: interrupt the program now or on the next connection. Resumes monitoring if paused."
+                          aria-label="Enter REPL" aria-pressed="false" onclick="doRepl()">{ICONS['repl']}</button>
                   <button id="resetItem" class="tb-icon"
                           title="Reset: reboot the board now, whatever state it's in"
                           aria-label="Reset device" onclick="doResetDevice()">{ICONS['reset']}</button>
@@ -526,6 +550,7 @@ def create_app(monitor, cfg):
           const stopShouldFlash = !!lastStatus.stop_armed && !lastStatus.halted;
           const pauseShouldFlash = !!lastStatus.pause_pending;
           document.getElementById('stopItem').classList.toggle('flash-on', stopShouldFlash && blinkOn);
+          document.getElementById('replItem').classList.toggle('flash-on', stopShouldFlash && blinkOn);
           document.getElementById('pauseMonItem').classList.toggle('flash-on', pauseShouldFlash && blinkOn);
         }}
         let blinkOn = false;
@@ -538,11 +563,13 @@ def create_app(monitor, cfg):
           }} else if (s.halted) {{
             dot = 'halt'; label = 'halted at REPL';
             sub = 'normal wake cycle is paused -- it will not go back to sleep on its own';
+          }} else if (s.stop_armed) {{
+            dot = 'pause'; label = 'REPL armed';
+            sub = 'will send the interrupt as soon as the device connects; press Stop again to cancel';
           }} else if (s.connected) {{
             dot = 'up'; label = 'connected';
           }} else {{
             dot = 'down'; label = 'disconnected';
-            if (s.stop_armed) sub = 'armed -- will halt the next time it wakes';
           }}
           if (s.pause_pending) {{
             sub = (sub ? sub + ' -- ' : '') + 'pause queued, waiting for the stop to complete';
@@ -578,6 +605,8 @@ def create_app(monitor, cfg):
           // relying on text alone:
           document.getElementById('resetItem').classList.toggle('lit', !!s.connected);
           document.getElementById('resumeItem').classList.toggle('lit-cyan', !!s.halted);
+          document.getElementById('replItem').classList.toggle('lit-cyan', !!s.halted);
+          document.getElementById('replItem').setAttribute('aria-pressed', String(!!s.halted || !!s.stop_armed));
           document.getElementById('resumeMonItem').classList.toggle('lit-amber', !s.monitoring);
 
           // Flashing (Stop while armed-not-halted, Pause while a pause is
@@ -588,6 +617,10 @@ def create_app(monitor, cfg):
         }}
 
         async function doStop() {{ await fetch('/api/stop', {{method:'POST'}}); }}
+        async function doRepl() {{
+          const res = await fetch('/api/device/repl', {{method:'POST'}});
+          if (res.ok) applyStatus(await res.json());
+        }}
         async function doResume() {{ await fetch('/api/resume', {{method:'POST'}}); }}
         async function doResetDevice() {{ await fetch('/api/device/reset', {{method:'POST'}}); }}
         async function doPauseMon() {{ await fetch('/api/monitoring/pause', {{method:'POST'}}); }}
@@ -653,6 +686,11 @@ def create_app(monitor, cfg):
     @app.route("/api/stop", methods=["POST"])
     def api_stop():
         monitor.request_stop()
+        return jsonify(monitor.get_status())
+
+    @app.route("/api/device/repl", methods=["POST"])
+    def api_device_repl():
+        monitor.request_repl()
         return jsonify(monitor.get_status())
 
     @app.route("/api/resume", methods=["POST"])
@@ -780,7 +818,8 @@ def create_app(monitor, cfg):
             color = STATUS_COLORS[r["status"]]
             text = monitor.read_session_text(r["id"]) if extractors else None
             values = fields.extract(text, extractors)
-            extra_cells = "".join(f'<td class="extra">{esc(values[e["name"]])}</td>' for e in extractors)
+            extra_cells = "".join(f'<td class="extra" data-field="{html.escape(e["name"], quote=True)}">'
+                                  f'{esc(values[e["name"]])}</td>' for e in extractors)
             rows += (
                 f'<tr class="session-row" data-session-id="{r["id"]}">'
                 f'<td><button type="button" class="session-toggle" title="View session" '
@@ -1094,7 +1133,7 @@ def create_app(monitor, cfg):
           <a href="/sessions/{sid-1}">&larr; session #{sid-1} (before)</a>
           <a href="/sessions/{sid+1}">session #{sid+1} (after) &rarr;</a>
         </div>
-        <pre class="term" style="height:70vh">{esc_text}</pre>
+        <pre class="term session-document">{esc_text}</pre>
         """
         return render(f"Session #{sid}", "sessions", body)
 

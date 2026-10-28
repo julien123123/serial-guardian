@@ -128,6 +128,12 @@ class CaptureTest(unittest.TestCase):
                         time.sleep(.002)
                     self.assertFalse(errors, errors)
                     self.assertEqual(monitor.last_session_id, cycle+1)
+                # last_session_id is allocated before the index append. Let
+                # the capture worker finish persisting the final session.
+                stop.set()
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
+                self.assertFalse(errors, errors)
                 records = list(monitor.iter_records())
                 self.assertEqual(len(records), 12)
                 self.assertTrue(all(record['status']=='NORMAL' for record in records))

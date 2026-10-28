@@ -431,6 +431,11 @@ as lamp behavior on the keys themselves:
 - **Stop** (device) *flashes amber* while armed but not yet in effect —
   stops the moment it actually halts. Click it again while flashing to
   **cancel** the armed stop instead of re-arming it.
+- **Enter REPL** (`>_`) uses the same interrupt, flashes amber while waiting
+  for a connection, and glows cyan once the interrupt has been sent.
+  It also resumes monitoring if paused and cancels any queued pause, so
+  Guardian can catch the device and display its output. Repeated presses
+  keep the request armed; use Stop to cancel it, or Resume to run again.
 - **Reset** (device) glows green **only while a serial session is
   currently open** — a live indicator of whether there's a connection for
   the soft-reset keystrokes to land on.
@@ -454,6 +459,17 @@ halted, running normally, or asleep — if connected, the same soft-reset
 keystrokes used for automatic exception recovery (and the same escalation
 to the hardware line if it doesn't come back); if asleep and not connected
 at all, only the hardware line (if wired) can do anything.
+
+**Enter REPL** sends the configured Stop bytes (Ctrl-C by default) immediately
+if connected, or as soon as the serial port next opens. It keeps monitoring
+active and suppresses automatic recovery for the intentional interruption.
+The firmware must support a serial interrupt; Guardian cannot wake a sleeping
+board over a USB link that is disconnected. This control enters REPL mode;
+to type commands, pause monitoring and connect a serial terminal.
+
+Expanded session logs and individual session pages grow with their contents.
+Long lines wrap, so session history uses the page's normal vertical scroll
+instead of a second scrolling area inside each log.
 
 **Monitoring** — *this is the one you want for mpremote.* **Pause** tells
 Guardian to stop touching the serial port entirely, so `mpremote` (or a

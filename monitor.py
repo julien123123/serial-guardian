@@ -275,7 +275,10 @@ class SerialSessionMonitor:
         if self.cfg.BOOT_BANNER_MARKER in line:
             with self.lock:
                 self.boot_count += 1
-                self._currently_halted = False
+                # Startup output can already be queued when we interrupt
+                # on open. It must not undo the deliberate REPL state.
+                if not self._user_stopped:
+                    self._currently_halted = False
             if self._awaiting_boot:
                 # Fresh boot right after our own soft reset -- split into a
                 # new session so the exception log doesn't get merged with
@@ -414,6 +417,24 @@ class SerialSessionMonitor:
     # ------------------------------------------------------------------ #
     # deliberate stop / resume -- called from Flask request threads
     # ------------------------------------------------------------------ #
+    def request_repl(self):
+        """Catch the next connection and interrupt into the REPL.
+
+        Unlike the Stop toggle, repeated requests keep the interrupt armed.
+        Resume monitoring and cancel a queued pause so the port stays open
+        to catch the board and display its prompt.
+        """
+        with self.lock:
+            self._monitoring_on = True
+            self._pause_pending = False
+            if self._currently_halted or self._stop_armed:
+                return
+            self._stop_armed = True
+            ser, live = self._ser, self.connected
+        logger.info("device REPL requested -- interrupt on next connection")
+        if live and ser is not None:
+            self._send_stop_keys(ser)
+
     def request_stop(self):
         """Arm a halt for the next time the board is connected, sending
         it immediately if it's connected right now. Calling this again
@@ -506,6 +527,8 @@ class SerialSessionMonitor:
         # override a deliberate stop.
         self._user_stopped = True
         self._pending_soft_reset_at = None
+        self._awaiting_boot = False
+        self._boot_deadline = None
         apply_deferred_pause = False
         with self.lock:
             self._stop_armed = False
