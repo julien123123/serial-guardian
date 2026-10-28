@@ -1,3 +1,4 @@
+import base64
 import copy
 import os
 import pty
@@ -66,6 +67,32 @@ class ReplTest(unittest.TestCase):
             self.assertEqual(self.monitor.get_status()['stop_count'], 1)
             self.assertFalse(select.select([master], [], [], .05)[0])
 
+            # A REPL prompt has no newline and must appear immediately.
+            os.write(master, b'>>> ')
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                output = self.client.get('/api/device/repl/output').json
+                if base64.b64decode(output['data']).endswith(b'>>> '):
+                    break
+                time.sleep(.002)
+            self.assertEqual(base64.b64decode(output['data']), b'>>> ')
+            cursor = output['cursor']
+            headers = {'X-Serial-Connection':str(state['serial_connections']),
+                       'X-Terminal-Session':str(state['terminal_session'])}
+            command = "print('café')\r".encode()
+            controls = b'\x03\x04\x1b[A\x7f\t\x05'
+            for data in [command, controls]:
+                result = self.client.post('/api/device/repl/input', data=data, headers=headers)
+                self.assertEqual(result.status_code, 200, result.json)
+                self.assertTrue(select.select([master], [], [], 1)[0])
+                self.assertEqual(os.read(master, 1024), data)
+            self.assertEqual(self.client.get(f'/api/device/repl/output?after={cursor}').json['data'], '')
+            self.assertFalse(self.monitor.get_status()['halted'])  # Ctrl-D ran the program.
+            self.client.post('/api/device/repl/input', data=b'\x03', headers=headers)
+            self.assertTrue(select.select([master], [], [], 1)[0])
+            self.assertEqual(os.read(master, 1024), b'\x03')
+            self.assertTrue(self.monitor.get_status()['halted'])
+
             self.client.post('/api/resume')
             self.assertTrue(select.select([master], [], [], 1)[0])
             self.assertEqual(os.read(master, 1024), b'\x04')
@@ -100,3 +127,61 @@ class ReplTest(unittest.TestCase):
         self.assertIsNone(self.monitor._pending_soft_reset_at)
         self.assertFalse(self.monitor._awaiting_boot)
         self.assertFalse(self.monitor._is_exception)
+
+    def test_input_is_rejected_after_pause_close_or_a_new_connection(self):
+        class Port:
+            def __init__(self): self.writes = []
+            def write(self, data): self.writes.append(data); return len(data)
+            def flush(self): pass
+        port = Port()
+        self.monitor._ser = port
+        self.monitor.connected = True
+        self.monitor.serial_connections = 1
+        state = self.client.post('/api/device/repl').json
+        headers = {'X-Serial-Connection':'1', 'X-Terminal-Session':str(state['terminal_session'])}
+        for invalid in [{}, dict(headers, **{'X-Serial-Connection':'bad'})]:
+            self.assertEqual(self.client.post('/api/device/repl/input', data=b'x', headers=invalid).status_code, 400)
+        self.assertEqual(self.client.post('/api/device/repl/input', data=b'x'*8193, headers=headers).status_code, 413)
+        self.client.post('/api/device/repl/close')
+        self.assertTrue(self.monitor.get_status()['halted'])  # Leaving input doesn't restart it.
+        self.assertEqual(self.client.post('/api/device/repl/input', data=b'x', headers=headers).status_code, 409)
+        state = self.client.post('/api/device/repl').json
+        self.assertNotEqual(state['terminal_session'], int(headers['X-Terminal-Session']))
+        self.assertEqual(self.client.post('/api/device/repl/input', data=b'x', headers=headers).status_code, 409)
+        headers['X-Terminal-Session'] = str(state['terminal_session'])
+        self.monitor.serial_connections = 2
+        self.assertEqual(self.client.post('/api/device/repl/input', data=b'x', headers=headers).status_code, 409)
+        headers['X-Serial-Connection'] = '2'
+        self.monitor.pause_monitoring()
+        self.assertEqual(self.client.post('/api/device/repl/input', data=b'x', headers=headers).status_code, 409)
+        self.assertEqual(port.writes, [self.cfg.STOP_BYTES])
+
+    def test_raw_output_is_bounded_and_resynchronizes_stale_cursors(self):
+        self.monitor._record_serial_bytes(b'x'*70000 + b'\r\n>>> ')
+        result = self.client.get('/api/device/repl/output?after=0')
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.headers['Cache-Control'], 'no-store')
+        self.assertTrue(result.json['clipped'])
+        self.assertEqual(len(base64.b64decode(result.json['data'])), 65536)
+        self.assertTrue(base64.b64decode(result.json['data']).endswith(b'\r\n>>> '))
+        for cursor in ['-1', 'nope', '1.2']:
+            self.assertEqual(self.client.get('/api/device/repl/output?after='+cursor).status_code, 400)
+        cursor = result.json['cursor']
+        self.assertTrue(self.client.get(f'/api/device/repl/output?after={cursor+1}').json['clipped'])
+
+    def test_serial_failure_does_not_retry_input(self):
+        class Port:
+            writes = 0
+            def write(self, data):
+                self.writes += 1
+                raise OSError('USB disconnected')
+        port = Port()
+        self.monitor._ser = port
+        self.monitor.connected = True
+        self.monitor._currently_halted = True
+        state = self.client.post('/api/device/repl').json
+        result = self.client.post('/api/device/repl/input', data=b'run()\r', headers={
+            'X-Serial-Connection':str(state['serial_connections']),
+            'X-Terminal-Session':str(state['terminal_session'])})
+        self.assertEqual(result.status_code, 503)
+        self.assertEqual(port.writes, 1)

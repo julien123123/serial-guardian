@@ -11,6 +11,7 @@ sessions", and the Settings page -- is reachable by anyone who can reach
 the Pi on your network. Fine on a trusted home LAN, worth knowing if
 that's not your situation.
 """
+import base64
 import html
 import json
 import math
@@ -271,6 +272,9 @@ BASE = """
   .monitor-screen pre.term { height:auto; overflow:visible; padding-bottom:0; }
   .monitor-screen pre.term:empty { display:none; }
   .monitor-screen pre.term:empty + .terminal-label-line { padding-top:0.9rem; }
+  .monitor-screen.repl-active { display:flex; flex-direction:column; overflow:hidden; }
+  #replTerminal { flex:1; min-height:0; padding:0.9rem 1rem 0; }
+  #replFeedback { margin:0; padding:0.3rem 1rem 0.6rem; font-size:0.75rem; }
   .live-stream-label { color:var(--ink-dim); }
   .terminal-label-line { padding:0 1rem 0.7rem; }
   .terminal-key { font:inherit; color:var(--ink-dim); border:0; padding:0;
@@ -417,6 +421,10 @@ def create_app(monitor, cfg):
         )
         exc_markers_json = json.dumps(cfg.EXCEPTION_MARKERS)
         body = f"""
+        <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
+        <script src="/static/vendor/xterm/xterm.js"></script>
+        <script src="/static/vendor/xterm/addon-fit.js"></script>
+        <script src="/static/repl.js"></script>
         <div class="stats">{stats_html}</div>
 
         <div class="console">
@@ -435,7 +443,7 @@ def create_app(monitor, cfg):
                           title="Resume normal operation" aria-label="Resume device"
                           onclick="doResume()">{ICONS['play']}</button>
                   <button id="replItem" class="tb-icon"
-                          title="Enter REPL: interrupt the program now or on the next connection. Resumes monitoring if paused."
+                          title="Interactive REPL: catch the device and type in this monitor. Click again to leave terminal input."
                           aria-label="Enter REPL" aria-pressed="false" onclick="doRepl()">{ICONS['repl']}</button>
                   <button id="resetItem" class="tb-icon"
                           title="Reset: reboot the board now, whatever state it's in"
@@ -468,7 +476,9 @@ def create_app(monitor, cfg):
           </div>
           <div class="monitor-screen">
             <pre class="term" id="tail"></pre>
-            <div class="terminal-label-line">
+            <div id="replTerminal" hidden></div>
+            <p class="hint" id="replFeedback" role="status" hidden></p>
+            <div class="terminal-label-line" id="liveLabelLine">
               <button id="liveLabelToggle" class="terminal-key" type="button" title="Add label"
                       aria-label="Add label" aria-expanded="false" aria-controls="liveLabelEditor">+</button>
               <div class="live-label-editor" id="liveLabelEditor" hidden>
@@ -492,6 +502,19 @@ def create_app(monitor, cfg):
         const liveLabelFeedback = document.getElementById('liveLabelFeedback');
         let streamItems = [];
         let streamRequest = 0;
+        const repl = new GuardianRepl({{
+          host:document.getElementById('replTerminal'),
+          feedback:document.getElementById('replFeedback'),
+          onStatus:applyStatus,
+          onModeChange(active) {{
+            document.querySelector('.monitor-screen').classList.toggle('repl-active', active);
+            document.getElementById('tail').hidden = active;
+            document.getElementById('liveLabelLine').hidden = active;
+            liveLabelToggle.disabled = active;
+            liveLabelInput.disabled = active;
+            if (active) setLiveLabelOpen(false);
+          }}
+        }});
         function setLiveLabelOpen(open) {{
           const tail = document.querySelector('.monitor-screen');
           const following = tail.scrollTop + tail.clientHeight >= tail.scrollHeight - 20;
@@ -557,9 +580,13 @@ def create_app(monitor, cfg):
         setInterval(() => {{ blinkOn = !blinkOn; applyBlink(); }}, 500);
 
         function applyStatus(s) {{
+          repl.setStatus(s);
           let dot, label, sub = '';
           if (!s.monitoring) {{
             dot = 'pause'; label = 'monitoring paused -- port free for mpremote';
+          }} else if (s.terminal_active && s.connected && !s.stop_armed) {{
+            dot = 'halt'; label = 'serial terminal';
+            sub = 'type in the monitor; click >_ again to leave terminal input';
           }} else if (s.halted) {{
             dot = 'halt'; label = 'halted at REPL';
             sub = 'normal wake cycle is paused -- it will not go back to sleep on its own';
@@ -605,8 +632,8 @@ def create_app(monitor, cfg):
           // relying on text alone:
           document.getElementById('resetItem').classList.toggle('lit', !!s.connected);
           document.getElementById('resumeItem').classList.toggle('lit-cyan', !!s.halted);
-          document.getElementById('replItem').classList.toggle('lit-cyan', !!s.halted);
-          document.getElementById('replItem').setAttribute('aria-pressed', String(!!s.halted || !!s.stop_armed));
+          document.getElementById('replItem').classList.toggle('lit-cyan', !!s.terminal_active && !!s.connected && !s.stop_armed);
+          document.getElementById('replItem').setAttribute('aria-pressed', String(!!s.terminal_active));
           document.getElementById('resumeMonItem').classList.toggle('lit-amber', !s.monitoring);
 
           // Flashing (Stop while armed-not-halted, Pause while a pause is
@@ -618,8 +645,11 @@ def create_app(monitor, cfg):
 
         async function doStop() {{ await fetch('/api/stop', {{method:'POST'}}); }}
         async function doRepl() {{
-          const res = await fetch('/api/device/repl', {{method:'POST'}});
-          if (res.ok) applyStatus(await res.json());
+          ++streamRequest;
+          ++pollGeneration;
+          await repl.toggle();
+          clearTimeout(pollTimer);
+          poll();
         }}
         async function doResume() {{ await fetch('/api/resume', {{method:'POST'}}); }}
         async function doResetDevice() {{ await fetch('/api/device/reset', {{method:'POST'}}); }}
@@ -655,10 +685,17 @@ def create_app(monitor, cfg):
           renderStream(data.stream);
           applyStatus(data.status);
         }}
-        async function poll() {{
-          try {{ await refreshStream(); }}
+        let pollTimer, pollGeneration = 0;
+        async function poll(generation = pollGeneration) {{
+          const requestId = ++streamRequest;
+          try {{
+            if (repl.active) await repl.refresh(() => requestId === streamRequest);
+            else await refreshStream();
+          }}
           catch (e) {{ /* pi rebooting, wifi hiccup, etc -- just retry */ }}
-          setTimeout(poll, 1500);
+          if (generation !== pollGeneration) return;
+          clearTimeout(pollTimer);
+          pollTimer = setTimeout(() => poll(generation), repl.active ? 100 : 1500);
         }}
         poll();
         </script>
@@ -692,6 +729,41 @@ def create_app(monitor, cfg):
     def api_device_repl():
         monitor.request_repl()
         return jsonify(monitor.get_status())
+
+    @app.route("/api/device/repl/close", methods=["POST"])
+    def api_device_repl_close():
+        monitor.close_repl()
+        return jsonify(monitor.get_status())
+
+    @app.route("/api/device/repl/output")
+    def api_device_repl_output():
+        try:
+            after = int(request.args["after"]) if "after" in request.args else None
+            if after is not None and after < 0:
+                raise ValueError
+        except ValueError:
+            return jsonify({"error": "invalid terminal cursor"}), 400
+        data, cursor, clipped = monitor.get_terminal_output(after)
+        return jsonify({"data": base64.b64encode(data).decode("ascii"), "cursor": cursor,
+                        "clipped": clipped, "status": monitor.get_status()}), 200, {"Cache-Control": "no-store"}
+
+    @app.route("/api/device/repl/input", methods=["POST"])
+    def api_device_repl_input():
+        data = request.stream.read(8193)
+        if len(data) > 8192:
+            return jsonify({"error": "Send at most 8192 bytes at once."}), 413
+        try:
+            connection = int(request.headers.get("X-Serial-Connection", ""))
+            session = int(request.headers.get("X-Terminal-Session", ""))
+        except ValueError:
+            return jsonify({"error": "missing serial connection or terminal session number"}), 400
+        try:
+            monitor.write_repl(data, connection, session)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except OSError:
+            return jsonify({"error": "Serial write failed. Input was not retried."}), 503
+        return jsonify({"ok": True})
 
     @app.route("/api/resume", methods=["POST"])
     def api_resume():

@@ -71,6 +71,7 @@ class SerialSessionMonitor:
     def __init__(self, cfg):
         self.cfg = cfg
         self.lock = threading.Lock()
+        self._serial_write_lock = threading.Lock()
 
         self.connected = False
         self.boot_count = 0
@@ -79,6 +80,10 @@ class SerialSessionMonitor:
         self.serial_bytes_received = 0
         self.empty_sessions = 0
         self.last_serial_open_error = None
+        self._terminal_active = False
+        self._terminal_session = 0
+        self._terminal_buffer = bytearray()
+        self._terminal_end = 0
         self.live_tail = collections.deque(maxlen=cfg.LIVE_TAIL_LINES)
         self.live_times = collections.deque(maxlen=cfg.LIVE_TAIL_LINES)
         self.live_started = time.time()
@@ -203,7 +208,7 @@ class SerialSessionMonitor:
         ser = None
         try:
             with CaptureSerial(cfg.SERIAL_PORT, cfg.BAUD,
-                                timeout=cfg.SERIAL_READ_TIMEOUT) as ser:
+                                timeout=cfg.SERIAL_READ_TIMEOUT, write_timeout=1.0) as ser:
                 with self.lock:
                     self.connected = True
                     self._ser = ser
@@ -219,8 +224,7 @@ class SerialSessionMonitor:
                     self._last_alive = time.time()
                     chunk = read_chunk(ser, min(cfg.SERIAL_READ_TIMEOUT, 0.1))
                     if chunk:
-                        with self.lock:
-                            self.serial_bytes_received += len(chunk)
+                        self._record_serial_bytes(chunk)
                         parts = (buf + chunk).split(b"\n")
                         buf = parts.pop()
                         for raw in parts:
@@ -241,6 +245,8 @@ class SerialSessionMonitor:
             self.connected = False
             self._ser = None
             self._currently_halted = False   # can't stay "halted" through a disconnect
+            if self._terminal_active and self._monitoring_on:
+                self._stop_armed = True
         self._finish_session()
         # Briefly back off if udev has not removed the old node yet. Device
         # creation after removal is handled by inotify on the next cycle.
@@ -378,8 +384,9 @@ class SerialSessionMonitor:
     # ------------------------------------------------------------------ #
     def _trigger_soft_reset(self, ser):
         try:
-            ser.write(self.cfg.SOFT_RESET_BYTES)
-            ser.flush()
+            with self._serial_write_lock:
+                ser.write(self.cfg.SOFT_RESET_BYTES)
+                ser.flush()
         except Exception:
             pass
         self._pending_soft_reset_at = None
@@ -425,6 +432,9 @@ class SerialSessionMonitor:
         to catch the board and display its prompt.
         """
         with self.lock:
+            if not self._terminal_active:
+                self._terminal_session += 1
+            self._terminal_active = True
             self._monitoring_on = True
             self._pause_pending = False
             if self._currently_halted or self._stop_armed:
@@ -435,6 +445,56 @@ class SerialSessionMonitor:
         if live and ser is not None:
             self._send_stop_keys(ser)
 
+    def close_repl(self):
+        """Leave browser input mode without rebooting or resuming the board."""
+        with self.lock:
+            self._terminal_active = False
+            if self._stop_armed and not self._currently_halted:
+                self._stop_armed = False
+                self._pause_pending = False
+
+    def _record_serial_bytes(self, data):
+        # Keep raw prompts, echoes and ANSI sequences independently of the
+        # newline-based session logger. Memory stays bounded at 64 KiB.
+        with self.lock:
+            self.serial_bytes_received += len(data)
+            self._terminal_end += len(data)
+            self._terminal_buffer.extend(data)
+            del self._terminal_buffer[:-65536]
+
+    def get_terminal_output(self, after=None):
+        with self.lock:
+            end = self._terminal_end
+            start = end - len(self._terminal_buffer)
+            clipped = after is not None and not start <= after <= end
+            offset = max(start, min(end, after)) if after is not None else start
+            if clipped:
+                offset = start
+            return bytes(self._terminal_buffer[offset-start:]), end, clipped
+
+    def write_repl(self, data, connection, session):
+        """Write browser keystrokes through the monitor's existing port.
+
+        Never buffer input for a later connection: stale commands must not
+        execute on a subsequent wake after a disconnect or deployment.
+        """
+        with self._serial_write_lock:
+            with self.lock:
+                if (not self._terminal_active or not self._monitoring_on
+                        or not self.connected or self._ser is None or self._stop_armed
+                        or connection != self.serial_connections or session != self._terminal_session):
+                    raise ValueError("Terminal is not connected. Input was not sent.")
+                ser = self._ser
+            if ser.write(data) != len(data):
+                raise OSError("Incomplete serial write. Input was not retried.")
+            # Ctrl-D may run the program again without closing USB. Don't
+            # leave the transport showing a deliberate halt after that.
+            interrupt, restart = data.rfind(b"\x03"), data.rfind(b"\x04")
+            if max(interrupt, restart) >= 0:
+                with self.lock:
+                    if self._ser is ser and self.connected:
+                        self._currently_halted = interrupt > restart
+
     def request_stop(self):
         """Arm a halt for the next time the board is connected, sending
         it immediately if it's connected right now. Calling this again
@@ -444,6 +504,7 @@ class SerialSessionMonitor:
         nothing left for it to wait on."""
         with self.lock:
             if self._stop_armed and not self._currently_halted:
+                self._terminal_active = False
                 self._stop_armed = False
                 had_pending_pause = self._pause_pending
                 self._pause_pending = False
@@ -471,6 +532,7 @@ class SerialSessionMonitor:
         reset_device() below)."""
         logger.info("device resume requested")
         with self.lock:
+            self._terminal_active = False
             was_armed_not_halted = self._stop_armed and not self._currently_halted
             self._stop_armed = False
             ser, live, was_halted = self._ser, self.connected, self._currently_halted
@@ -480,8 +542,9 @@ class SerialSessionMonitor:
                 logger.info("pending pause cancelled -- the stop it was waiting for was cancelled first")
         if live and ser is not None and was_halted:
             try:
-                ser.write(b"\x04")
-                ser.flush()
+                with self._serial_write_lock:
+                    ser.write(b"\x04")
+                    ser.flush()
             except Exception:
                 pass
 
@@ -496,11 +559,13 @@ class SerialSessionMonitor:
         immediately instead since it doesn't need the USB link."""
         logger.info("manual device reset requested")
         with self.lock:
+            self._terminal_active = False
             ser, live = self._ser, self.connected
         if live and ser is not None:
             try:
-                ser.write(self.cfg.SOFT_RESET_BYTES)
-                ser.flush()
+                with self._serial_write_lock:
+                    ser.write(self.cfg.SOFT_RESET_BYTES)
+                    ser.flush()
             except Exception:
                 pass
             self._awaiting_boot = True
@@ -516,8 +581,9 @@ class SerialSessionMonitor:
 
     def _send_stop_keys(self, ser):
         try:
-            ser.write(self.cfg.STOP_BYTES)
-            ser.flush()
+            with self._serial_write_lock:
+                ser.write(self.cfg.STOP_BYTES)
+                ser.flush()
         except Exception:
             logger.warning("could not send device stop keys", exc_info=True)
             return
@@ -563,6 +629,7 @@ class SerialSessionMonitor:
         queued pause instead -- acts as a toggle in that specific state
         -- leaving the stop itself untouched."""
         with self.lock:
+            self._terminal_active = False
             if self._pause_pending:
                 self._pause_pending = False
                 action = "cancel"
@@ -607,6 +674,8 @@ class SerialSessionMonitor:
                 "last_session_id": self.last_session_id,
                 "stop_armed": self._stop_armed,
                 "halted": self._currently_halted,
+                "terminal_active": self._terminal_active,
+                "terminal_session": self._terminal_session,
             }
 
     def get_tail(self):

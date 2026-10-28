@@ -88,7 +88,7 @@ sudo apt update
 sudo apt install -y python3-serial python3-flask python3-waitress git
 mkdir -p /home/pi/serial-guardian
 # copy config.py, monitor.py, serial_capture.py, webapp.py, fields.py, labels.py, exporter.py,
-# settings.py, applog.py, sdnotify.py, watchdog.py, run.py, systemd/ here
+# settings.py, applog.py, sdnotify.py, watchdog.py, run.py, static/, systemd/ here
 #   e.g. scp -r ./pi-serial-guardian/* pi@guardian.local:~/serial-guardian/
 ```
 
@@ -434,8 +434,12 @@ as lamp behavior on the keys themselves:
 - **Enter REPL** (`>_`) uses the same interrupt, flashes amber while waiting
   for a connection, and glows cyan once the interrupt has been sent.
   It also resumes monitoring if paused and cancels any queued pause, so
-  Guardian can catch the device and display its output. Repeated presses
-  keep the request armed; use Stop to cancel it, or Resume to run again.
+  Guardian can catch the device. The monitor becomes an interactive serial
+  terminal: click inside and type, including arrows, Tab, pasted text and
+  Ctrl-C/Ctrl-D. Label insertion is hidden and disabled in this mode.
+  On Linux, Ctrl-Shift-V pastes from the clipboard, as in a terminal.
+  Click `>_` again to leave terminal input; the board stays stopped until
+  Resume or Reset. Closing while waiting cancels the pending interrupt.
 - **Reset** (device) glows green **only while a serial session is
   currently open** — a live indicator of whether there's a connection for
   the soft-reset keystrokes to land on.
@@ -465,7 +469,18 @@ if connected, or as soon as the serial port next opens. It keeps monitoring
 active and suppresses automatic recovery for the intentional interruption.
 The firmware must support a serial interrupt; Guardian cannot wake a sleeping
 board over a USB link that is disconnected. This control enters REPL mode;
-to type commands, pause monitoring and connect a serial terminal.
+Guardian relays terminal input through its existing serial connection, so
+there is no need to pause monitoring or connect a separate terminal.
+Prompts and echoes appear even without a newline. Input is disabled while
+disconnected; pending keystrokes are discarded instead of replayed on a
+later connection. If the board disconnects while terminal mode is active,
+Guardian arms the interrupt again for its next wake.
+
+The terminal emulator (xterm.js, MIT) is bundled under `static/vendor/` and
+runs in the browser. Copy the entire `static/` directory when updating the
+Pi. No CDN or build step is needed. Guardian keeps at most 64 KiB of raw
+terminal output and polls for new bytes only while terminal mode is active;
+normal monitoring keeps its usual slower refresh rate.
 
 Expanded session logs and individual session pages grow with their contents.
 Long lines wrap, so session history uses the page's normal vertical scroll

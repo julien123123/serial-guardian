@@ -33,6 +33,8 @@ browser tab instead of a terminal you have to babysit.
   fallback) and logs everything forever except routine `NORMAL` sessions,
   which get pruned so the SD card doesn't fill up
 - Live web view + full session history, filterable by status
+- Interactive serial REPL directly in the live monitor: type commands,
+  paste code, and use Ctrl-C/Ctrl-D without opening another terminal
 - One-click Stop / Resume / Reset on the device itself, and a Pause that
   frees the serial port for `mpremote` or a terminal without touching the
   service
